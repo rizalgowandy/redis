@@ -10,6 +10,12 @@ import (
 // decoderFunc represents decoding functions for default built-in types.
 type decoderFunc func(reflect.Value, string) error
 
+// Scanner is the interface implemented by themselves,
+// which will override the decoding behavior of decoderFunc.
+type Scanner interface {
+	ScanRedis(s string) error
+}
+
 var (
 	// List of built-in decoders indexed by their numeric constant values (eg: reflect.Bool = 1).
 	decoders = []decoderFunc{
@@ -24,6 +30,7 @@ var (
 		reflect.Uint16:        decodeUint16,
 		reflect.Uint32:        decodeUint32,
 		reflect.Uint64:        decodeUint64,
+		reflect.Uintptr:       decodeUnsupported,
 		reflect.Float32:       decodeFloat32,
 		reflect.Float64:       decodeFloat64,
 		reflect.Complex64:     decodeUnsupported,
@@ -33,7 +40,7 @@ var (
 		reflect.Func:          decodeUnsupported,
 		reflect.Interface:     decodeUnsupported,
 		reflect.Map:           decodeUnsupported,
-		reflect.Ptr:           decodeUnsupported,
+		reflect.Pointer:       decodeUnsupported,
 		reflect.Slice:         decodeSlice,
 		reflect.String:        decodeString,
 		reflect.Struct:        decodeUnsupported,
@@ -49,8 +56,8 @@ var (
 func Struct(dst interface{}) (StructValue, error) {
 	v := reflect.ValueOf(dst)
 
-	// The dstination to scan into should be a struct pointer.
-	if v.Kind() != reflect.Ptr || v.IsNil() {
+	// The destination to scan into should be a struct pointer.
+	if v.Kind() != reflect.Pointer || v.IsNil() {
 		return StructValue{}, fmt.Errorf("redis.Scan(non-pointer %T)", dst)
 	}
 
@@ -66,7 +73,10 @@ func Struct(dst interface{}) (StructValue, error) {
 }
 
 // Scan scans the results from a key-value Redis map result set to a destination struct.
-// The Redis keys are matched to the struct's field with the `redis` tag.
+// The Redis keys are matched to the struct's field with the `redis` tag. If a field
+// fails to decode, Scan still sets every other field it can. One failing field
+// returns its error as is; several return them joined with errors.Join in key
+// order, so errors.Is and errors.As match any of them.
 func Scan(dst interface{}, keys []interface{}, vals []interface{}) error {
 	if len(keys) != len(vals) {
 		return errors.New("args should have the same number of keys and vals")
@@ -76,6 +86,8 @@ func Scan(dst interface{}, keys []interface{}, vals []interface{}) error {
 	if err != nil {
 		return err
 	}
+
+	var scanErrors []error
 
 	// Iterate through the (key, value) sequence.
 	for i := 0; i < len(vals); i++ {
@@ -90,11 +102,25 @@ func Scan(dst interface{}, keys []interface{}, vals []interface{}) error {
 		}
 
 		if err := strct.Scan(key, val); err != nil {
-			return err
+			scanErrors = append(scanErrors, err)
 		}
 	}
 
-	return nil
+	return JoinErrors(scanErrors)
+}
+
+// JoinErrors returns nil for no errors, the error itself for one, and
+// errors.Join of all of them for several. A single field error keeps its
+// value and text; several stay reachable through errors.Is and errors.As.
+func JoinErrors(errs []error) error {
+	switch len(errs) {
+	case 0:
+		return nil
+	case 1:
+		return errs[0]
+	default:
+		return errors.Join(errs...)
+	}
 }
 
 func decodeBool(f reflect.Value, s string) error {

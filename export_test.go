@@ -5,11 +5,17 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"testing"
 
-	"github.com/go-redis/redis/v8/internal"
-	"github.com/go-redis/redis/v8/internal/hashtag"
-	"github.com/go-redis/redis/v8/internal/pool"
+	"github.com/redis/go-redis/v9/internal"
+	"github.com/redis/go-redis/v9/internal/hashtag"
+	"github.com/redis/go-redis/v9/internal/pool"
 )
+
+func NewTestRedisAddr(t *testing.T) string {
+	t.Helper()
+	return newFDStateServer(t).addr()
+}
 
 func (c *baseClient) Pool() pool.Pooler {
 	return c.connPool
@@ -60,21 +66,21 @@ func (c *ClusterClient) SwapNodes(ctx context.Context, key string) error {
 	return nil
 }
 
-func (state *clusterState) IsConsistent(ctx context.Context) bool {
-	if len(state.Masters) < 3 {
+func (c *clusterState) IsConsistent(ctx context.Context) bool {
+	if len(c.Masters) < 3 {
 		return false
 	}
-	for _, master := range state.Masters {
+	for _, master := range c.Masters {
 		s := master.Client.Info(ctx, "replication").Val()
 		if !strings.Contains(s, "role:master") {
 			return false
 		}
 	}
 
-	if len(state.Slaves) < 3 {
+	if len(c.Slaves) < 3 {
 		return false
 	}
-	for _, slave := range state.Slaves {
+	for _, slave := range c.Slaves {
 		s := slave.Client.Info(ctx, "replication").Val()
 		if !strings.Contains(s, "role:slave") {
 			return false
@@ -85,11 +91,99 @@ func (state *clusterState) IsConsistent(ctx context.Context) bool {
 }
 
 func GetSlavesAddrByName(ctx context.Context, c *SentinelClient, name string) []string {
-	addrs, err := c.Slaves(ctx, name).Result()
+	addrs, err := c.Replicas(ctx, name).Result()
 	if err != nil {
-		internal.Logger.Printf(ctx, "sentinel: Slaves name=%q failed: %s",
+		internal.Logger.Printf(ctx, "sentinel: Replicas name=%q failed: %s",
 			name, err)
 		return []string{}
 	}
-	return parseSlaveAddrs(addrs, false)
+	return parseReplicaAddrs(addrs, false)
+}
+
+func (c *Ring) ShardByName(name string) *ringShard {
+	shard, _ := c.sharding.GetByName(name)
+	return shard
+}
+
+func (c *ModuleLoadexConfig) ToArgs() []interface{} {
+	return c.toArgs()
+}
+
+func ShouldRetry(err error, retryTimeout bool) bool {
+	return shouldRetry(err, retryTimeout)
+}
+
+// SentinelFailoverHasSentinel returns true if the sentinelFailover
+// still holds a live sentinel connection. Used in tests to verify
+// that replicaAddrs does not tear down the sentinel for master-only
+// (zero-replica) setups.
+func (c *sentinelFailover) HasSentinel() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.sentinel != nil
+}
+
+// NewTestSentinelFailover creates a sentinelFailover with minimal
+// options for unit testing. The caller must set c.sentinel manually.
+func NewTestSentinelFailover(opt *FailoverOptions, sentinelAddrs []string) *sentinelFailover {
+	return &sentinelFailover{
+		opt:           opt,
+		sentinelAddrs: sentinelAddrs,
+	}
+}
+
+// ReplicaAddrs is exported for testing.
+func (c *sentinelFailover) ReplicaAddrs(ctx context.Context) ([]string, error) {
+	return c.replicaAddrs(ctx, false)
+}
+
+// TestBreakerRecordFailure records one failure on the given member's circuit
+// breaker. Exported for testing breaker-gate interactions.
+func (c *MultiDBClient) TestBreakerRecordFailure(id int) {
+	c.core.dbByID(id).cb.RecordFailure()
+}
+
+// TestBreakerReserveHalfOpen runs the given member's breaker admission check,
+// reserving one half-open probe slot when the breaker is half-open. Exported
+// for testing breaker-gate interactions.
+func (c *MultiDBClient) TestBreakerReserveHalfOpen(id int) bool {
+	return c.core.dbByID(id).cb.IsAllowed()
+}
+
+// TestProbeRacingRemoval reproduces the background health-check loop racing a
+// concurrent RemoveDatabase: the member is snapshotted (as the loop does),
+// removed, and then probed through the stale snapshot.
+func (c *MultiDBClient) TestProbeRacingRemoval(id int) {
+	db := c.core.dbByID(id)
+	if err := c.core.removeDatabase(context.Background(), id); err != nil {
+		panic(err)
+	}
+	db.probe(context.Background(), c.core.opts.HealthCheckTimeout)
+}
+
+// TestRunHealthChecksOnce runs one synchronous background health-check pass.
+func (c *MultiDBClient) TestRunHealthChecksOnce() {
+	c.core.runHealthChecksOnce(context.Background())
+}
+
+// TestTryFallback runs one synchronous auto-fallback pass.
+func (c *MultiDBClient) TestTryFallback() {
+	c.core.tryFallbackToPrimary(context.Background())
+}
+
+// TestTryFailover runs one synchronous automatic-failover pass from the given
+// database id, as the command hot path and background loop do.
+func (c *MultiDBClient) TestTryFailover(from int) error {
+	return c.core.tryFailover(context.Background(), from)
+}
+
+// TestStaleRecordAfterRemoval simulates a probe that passed its removed-check
+// just before the member was removed: the breaker outcome lands after the
+// removal completed.
+func (c *MultiDBClient) TestStaleRecordAfterRemoval(id int) {
+	db := c.core.dbByID(id)
+	if err := c.core.removeDatabase(context.Background(), id); err != nil {
+		panic(err)
+	}
+	db.cb.RecordFailure()
 }

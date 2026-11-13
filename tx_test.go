@@ -5,10 +5,10 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/go-redis/redis/v8"
+	. "github.com/bsm/ginkgo/v2"
+	. "github.com/bsm/gomega"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/redis/go-redis/v9"
 )
 
 var _ = Describe("Tx", func() {
@@ -64,7 +64,7 @@ var _ = Describe("Tx", func() {
 		Expect(n).To(Equal(int64(100)))
 	})
 
-	It("should discard", func() {
+	It("should discard", Label("NonRedisEnterprise"), func() {
 		err := client.Watch(ctx, func(tx *redis.Tx) error {
 			cmds, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 				pipe.Set(ctx, "key1", "hello1", 0)
@@ -141,9 +141,6 @@ var _ = Describe("Tx", func() {
 			})
 			return err
 		}
-
-		err = do()
-		Expect(err).To(MatchError("bad connection"))
 
 		err = do()
 		Expect(err).NotTo(HaveOccurred())

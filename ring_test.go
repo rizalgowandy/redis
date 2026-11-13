@@ -9,11 +9,42 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-redis/redis/v8"
+	. "github.com/bsm/ginkgo/v2"
+	. "github.com/bsm/gomega"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/redis/go-redis/v9"
 )
+
+var _ = Describe("Redis Ring PROTO 2", func() {
+	const heartbeat = 100 * time.Millisecond
+
+	var ring *redis.Ring
+
+	BeforeEach(func() {
+		opt := redisRingOptions()
+		opt.Protocol = 2
+		opt.HeartbeatFrequency = heartbeat
+		ring = redis.NewRing(opt)
+
+		err := ring.ForEachShard(ctx, func(ctx context.Context, cl *redis.Client) error {
+			return cl.FlushDB(ctx).Err()
+		})
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	AfterEach(func() {
+		Expect(ring.Close()).NotTo(HaveOccurred())
+	})
+
+	It("should ring PROTO 2", func() {
+		_ = ring.ForEachShard(ctx, func(ctx context.Context, c *redis.Client) error {
+			val, err := c.Do(ctx, "HELLO").Result()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(val).Should(ContainElements("proto", int64(2)))
+			return nil
+		})
+	})
+})
 
 var _ = Describe("Redis Ring", func() {
 	const heartbeat = 100 * time.Millisecond
@@ -29,6 +60,7 @@ var _ = Describe("Redis Ring", func() {
 
 	BeforeEach(func() {
 		opt := redisRingOptions()
+		opt.ClientName = "ring_hi"
 		opt.HeartbeatFrequency = heartbeat
 		ring = redis.NewRing(opt)
 
@@ -42,12 +74,41 @@ var _ = Describe("Redis Ring", func() {
 		Expect(ring.Close()).NotTo(HaveOccurred())
 	})
 
+	It("do", func() {
+		val, err := ring.Do(ctx, "ping").Result()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(val).To(Equal("PONG"))
+	})
+
 	It("supports context", func() {
 		ctx, cancel := context.WithCancel(ctx)
 		cancel()
 
 		err := ring.Ping(ctx).Err()
 		Expect(err).To(MatchError("context canceled"))
+	})
+
+	It("should ring client setname", func() {
+		err := ring.ForEachShard(ctx, func(ctx context.Context, c *redis.Client) error {
+			return c.Ping(ctx).Err()
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		_ = ring.ForEachShard(ctx, func(ctx context.Context, c *redis.Client) error {
+			val, err := c.ClientList(ctx).Result()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(val).Should(ContainSubstring("name=ring_hi"))
+			return nil
+		})
+	})
+
+	It("should ring PROTO 3", func() {
+		_ = ring.ForEachShard(ctx, func(ctx context.Context, c *redis.Client) error {
+			val, err := c.Do(ctx, "HELLO").Result()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(val).Should(HaveKeyWithValue("proto", int64(3)))
+			return nil
+		})
 	})
 
 	It("distributes keys", func() {
@@ -75,34 +136,6 @@ var _ = Describe("Redis Ring", func() {
 		Expect(ringShard2.Info(ctx, "keyspace").Val()).To(ContainSubstring("keys=44"))
 	})
 
-	It("uses single shard when one of the shards is down", func() {
-		// Stop ringShard2.
-		Expect(ringShard2.Close()).NotTo(HaveOccurred())
-
-		Eventually(func() int {
-			return ring.Len()
-		}, "30s").Should(Equal(1))
-
-		setRingKeys()
-
-		// RingShard1 should have all keys.
-		Expect(ringShard1.Info(ctx, "keyspace").Val()).To(ContainSubstring("keys=100"))
-
-		// Start ringShard2.
-		var err error
-		ringShard2, err = startRedis(ringShard2Port)
-		Expect(err).NotTo(HaveOccurred())
-
-		Eventually(func() int {
-			return ring.Len()
-		}, "30s").Should(Equal(2))
-
-		setRingKeys()
-
-		// RingShard2 should have its keys.
-		Expect(ringShard2.Info(ctx, "keyspace").Val()).To(ContainSubstring("keys=44"))
-	})
-
 	It("supports hash tags", func() {
 		for i := 0; i < 100; i++ {
 			err := ring.Set(ctx, fmt.Sprintf("key%d{tag}", i), "value", 0).Err()
@@ -113,7 +146,81 @@ var _ = Describe("Redis Ring", func() {
 		Expect(ringShard2.Info(ctx, "keyspace").Val()).To(ContainSubstring("keys=100"))
 	})
 
+	Describe("[new] dynamic setting ring shards", func() {
+		It("downscale shard and check reuse shard, upscale shard and check reuse", func() {
+			Expect(ring.Len(), 2)
+
+			wantShard := ring.ShardByName("ringShardOne")
+			ring.SetAddrs(map[string]string{
+				"ringShardOne": ":" + ringShard1Port,
+			})
+			Expect(ring.Len(), 1)
+			gotShard := ring.ShardByName("ringShardOne")
+			Expect(gotShard).To(BeIdenticalTo(wantShard))
+
+			ring.SetAddrs(map[string]string{
+				"ringShardOne": ":" + ringShard1Port,
+				"ringShardTwo": ":" + ringShard2Port,
+			})
+			Expect(ring.Len(), 2)
+			gotShard = ring.ShardByName("ringShardOne")
+			Expect(gotShard).To(BeIdenticalTo(wantShard))
+		})
+
+		It("uses 3 shards after setting it to 3 shards", func() {
+			Expect(ring.Len(), 2)
+
+			shardName1 := "ringShardOne"
+			shardAddr1 := ":" + ringShard1Port
+			wantShard1 := ring.ShardByName(shardName1)
+			shardName2 := "ringShardTwo"
+			shardAddr2 := ":" + ringShard2Port
+			wantShard2 := ring.ShardByName(shardName2)
+			shardName3 := "ringShardThree"
+			shardAddr3 := ":" + ringShard3Port
+
+			ring.SetAddrs(map[string]string{
+				shardName1: shardAddr1,
+				shardName2: shardAddr2,
+				shardName3: shardAddr3,
+			})
+			Expect(ring.Len(), 3)
+			gotShard1 := ring.ShardByName(shardName1)
+			gotShard2 := ring.ShardByName(shardName2)
+			gotShard3 := ring.ShardByName(shardName3)
+			Expect(gotShard1).To(BeIdenticalTo(wantShard1))
+			Expect(gotShard2).To(BeIdenticalTo(wantShard2))
+			Expect(gotShard3).ToNot(BeNil())
+
+			ring.SetAddrs(map[string]string{
+				shardName1: shardAddr1,
+				shardName2: shardAddr2,
+			})
+			Expect(ring.Len(), 2)
+			gotShard1 = ring.ShardByName(shardName1)
+			gotShard2 = ring.ShardByName(shardName2)
+			gotShard3 = ring.ShardByName(shardName3)
+			Expect(gotShard1).To(BeIdenticalTo(wantShard1))
+			Expect(gotShard2).To(BeIdenticalTo(wantShard2))
+			Expect(gotShard3).To(BeNil())
+		})
+	})
 	Describe("pipeline", func() {
+		It("doesn't panic closed ring, returns error", func() {
+			pipe := ring.Pipeline()
+			for i := 0; i < 3; i++ {
+				err := pipe.Set(ctx, fmt.Sprintf("key%d", i), "value", 0).Err()
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			Expect(ring.Close()).NotTo(HaveOccurred())
+
+			Expect(func() {
+				_, execErr := pipe.Exec(ctx)
+				Expect(execErr).To(HaveOccurred())
+			}).NotTo(Panic())
+		})
+
 		It("distributes keys", func() {
 			pipe := ring.Pipeline()
 			for i := 0; i < 100; i++ {
@@ -123,7 +230,6 @@ var _ = Describe("Redis Ring", func() {
 			cmds, err := pipe.Exec(ctx)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(cmds).To(HaveLen(100))
-			Expect(pipe.Close()).NotTo(HaveOccurred())
 
 			for _, cmd := range cmds {
 				Expect(cmd.Err()).NotTo(HaveOccurred())
@@ -171,12 +277,28 @@ var _ = Describe("Redis Ring", func() {
 			Expect(ringShard1.Info(ctx).Val()).ToNot(ContainSubstring("keys="))
 			Expect(ringShard2.Info(ctx).Val()).To(ContainSubstring("keys=100"))
 		})
+
+		It("return dial timeout error", func() {
+			opt := redisRingOptions()
+			opt.DialTimeout = 250 * time.Millisecond
+			opt.Addrs = map[string]string{"ringShardNotExist": ":1997"}
+			ring = redis.NewRing(opt)
+
+			_, err := ring.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.HSet(ctx, "key", "value")
+				pipe.Expire(ctx, "key", time.Minute)
+				return nil
+			})
+
+			Expect(err).To(HaveOccurred())
+		})
 	})
 
 	Describe("new client callback", func() {
 		It("can be initialized with a new client callback", func() {
 			opts := redisRingOptions()
-			opts.NewClient = func(name string, opt *redis.Options) *redis.Client {
+			opts.NewClient = func(opt *redis.Options) *redis.Client {
+				opt.Username = "username1"
 				opt.Password = "password1"
 				return redis.NewClient(opt)
 			}
@@ -184,54 +306,60 @@ var _ = Describe("Redis Ring", func() {
 
 			err := ring.Ping(ctx).Err()
 			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("ERR AUTH"))
+			Expect(err.Error()).To(ContainSubstring("WRONGPASS"))
 		})
 	})
 
 	Describe("Process hook", func() {
 		BeforeEach(func() {
-			//the health check leads to data race for variable "stack []string".
-			//here, the health check time is set to 72 hours to avoid health check
+			// the health check leads to data race for variable "stack []string".
+			// here, the health check time is set to 72 hours to avoid health check
 			opt := redisRingOptions()
 			opt.HeartbeatFrequency = 72 * time.Hour
 			ring = redis.NewRing(opt)
 		})
 		It("supports Process hook", func() {
-			err := ring.Ping(ctx).Err()
+			err := ring.Set(ctx, "key", "test", 0).Err()
 			Expect(err).NotTo(HaveOccurred())
 
 			var stack []string
 
 			ring.AddHook(&hook{
-				beforeProcess: func(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
-					Expect(cmd.String()).To(Equal("ping: "))
-					stack = append(stack, "ring.BeforeProcess")
-					return ctx, nil
-				},
-				afterProcess: func(ctx context.Context, cmd redis.Cmder) error {
-					Expect(cmd.String()).To(Equal("ping: PONG"))
-					stack = append(stack, "ring.AfterProcess")
-					return nil
+				processHook: func(hook redis.ProcessHook) redis.ProcessHook {
+					return func(ctx context.Context, cmd redis.Cmder) error {
+						Expect(cmd.String()).To(Equal("get key: "))
+						stack = append(stack, "ring.BeforeProcess")
+
+						err := hook(ctx, cmd)
+
+						Expect(cmd.String()).To(Equal("get key: test"))
+						stack = append(stack, "ring.AfterProcess")
+
+						return err
+					}
 				},
 			})
 
 			ring.ForEachShard(ctx, func(ctx context.Context, shard *redis.Client) error {
 				shard.AddHook(&hook{
-					beforeProcess: func(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
-						Expect(cmd.String()).To(Equal("ping: "))
-						stack = append(stack, "shard.BeforeProcess")
-						return ctx, nil
-					},
-					afterProcess: func(ctx context.Context, cmd redis.Cmder) error {
-						Expect(cmd.String()).To(Equal("ping: PONG"))
-						stack = append(stack, "shard.AfterProcess")
-						return nil
+					processHook: func(hook redis.ProcessHook) redis.ProcessHook {
+						return func(ctx context.Context, cmd redis.Cmder) error {
+							Expect(cmd.String()).To(Equal("get key: "))
+							stack = append(stack, "shard.BeforeProcess")
+
+							err := hook(ctx, cmd)
+
+							Expect(cmd.String()).To(Equal("get key: test"))
+							stack = append(stack, "shard.AfterProcess")
+
+							return err
+						}
 					},
 				})
 				return nil
 			})
 
-			err = ring.Ping(ctx).Err()
+			err = ring.Get(ctx, "key").Err()
 			Expect(err).NotTo(HaveOccurred())
 			Expect(stack).To(Equal([]string{
 				"ring.BeforeProcess",
@@ -248,33 +376,47 @@ var _ = Describe("Redis Ring", func() {
 			var stack []string
 
 			ring.AddHook(&hook{
-				beforeProcessPipeline: func(ctx context.Context, cmds []redis.Cmder) (context.Context, error) {
-					Expect(cmds).To(HaveLen(1))
-					Expect(cmds[0].String()).To(Equal("ping: "))
-					stack = append(stack, "ring.BeforeProcessPipeline")
-					return ctx, nil
-				},
-				afterProcessPipeline: func(ctx context.Context, cmds []redis.Cmder) error {
-					Expect(cmds).To(HaveLen(1))
-					Expect(cmds[0].String()).To(Equal("ping: PONG"))
-					stack = append(stack, "ring.AfterProcessPipeline")
-					return nil
+				processPipelineHook: func(hook redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+					return func(ctx context.Context, cmds []redis.Cmder) error {
+						// skip the connection initialization
+						if cmds[0].Name() == "hello" || cmds[0].Name() == "client" {
+							return nil
+						}
+						Expect(len(cmds)).To(BeNumerically(">", 0))
+						Expect(cmds[0].String()).To(Equal("ping: "))
+						stack = append(stack, "ring.BeforeProcessPipeline")
+
+						err := hook(ctx, cmds)
+
+						Expect(len(cmds)).To(BeNumerically(">", 0))
+						Expect(cmds[0].String()).To(Equal("ping: PONG"))
+						stack = append(stack, "ring.AfterProcessPipeline")
+
+						return err
+					}
 				},
 			})
 
 			ring.ForEachShard(ctx, func(ctx context.Context, shard *redis.Client) error {
 				shard.AddHook(&hook{
-					beforeProcessPipeline: func(ctx context.Context, cmds []redis.Cmder) (context.Context, error) {
-						Expect(cmds).To(HaveLen(1))
-						Expect(cmds[0].String()).To(Equal("ping: "))
-						stack = append(stack, "shard.BeforeProcessPipeline")
-						return ctx, nil
-					},
-					afterProcessPipeline: func(ctx context.Context, cmds []redis.Cmder) error {
-						Expect(cmds).To(HaveLen(1))
-						Expect(cmds[0].String()).To(Equal("ping: PONG"))
-						stack = append(stack, "shard.AfterProcessPipeline")
-						return nil
+					processPipelineHook: func(hook redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+						return func(ctx context.Context, cmds []redis.Cmder) error {
+							// skip the connection initialization
+							if cmds[0].Name() == "hello" || cmds[0].Name() == "client" {
+								return nil
+							}
+							Expect(len(cmds)).To(BeNumerically(">", 0))
+							Expect(cmds[0].String()).To(Equal("ping: "))
+							stack = append(stack, "shard.BeforeProcessPipeline")
+
+							err := hook(ctx, cmds)
+
+							Expect(len(cmds)).To(BeNumerically(">", 0))
+							Expect(cmds[0].String()).To(Equal("ping: PONG"))
+							stack = append(stack, "shard.AfterProcessPipeline")
+
+							return err
+						}
 					},
 				})
 				return nil
@@ -300,33 +442,51 @@ var _ = Describe("Redis Ring", func() {
 			var stack []string
 
 			ring.AddHook(&hook{
-				beforeProcessPipeline: func(ctx context.Context, cmds []redis.Cmder) (context.Context, error) {
-					Expect(cmds).To(HaveLen(1))
-					Expect(cmds[0].String()).To(Equal("ping: "))
-					stack = append(stack, "ring.BeforeProcessPipeline")
-					return ctx, nil
-				},
-				afterProcessPipeline: func(ctx context.Context, cmds []redis.Cmder) error {
-					Expect(cmds).To(HaveLen(1))
-					Expect(cmds[0].String()).To(Equal("ping: PONG"))
-					stack = append(stack, "ring.AfterProcessPipeline")
-					return nil
+				processPipelineHook: func(hook redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+					return func(ctx context.Context, cmds []redis.Cmder) error {
+						defer GinkgoRecover()
+						// skip the connection initialization
+						if cmds[0].Name() == "hello" || cmds[0].Name() == "client" {
+							return nil
+						}
+
+						Expect(len(cmds)).To(BeNumerically(">=", 3))
+						Expect(cmds[1].String()).To(Equal("ping: "))
+						stack = append(stack, "ring.BeforeProcessPipeline")
+
+						err := hook(ctx, cmds)
+
+						Expect(len(cmds)).To(BeNumerically(">=", 3))
+						Expect(cmds[1].String()).To(Equal("ping: PONG"))
+						stack = append(stack, "ring.AfterProcessPipeline")
+
+						return err
+					}
 				},
 			})
 
 			ring.ForEachShard(ctx, func(ctx context.Context, shard *redis.Client) error {
 				shard.AddHook(&hook{
-					beforeProcessPipeline: func(ctx context.Context, cmds []redis.Cmder) (context.Context, error) {
-						Expect(cmds).To(HaveLen(3))
-						Expect(cmds[1].String()).To(Equal("ping: "))
-						stack = append(stack, "shard.BeforeProcessPipeline")
-						return ctx, nil
-					},
-					afterProcessPipeline: func(ctx context.Context, cmds []redis.Cmder) error {
-						Expect(cmds).To(HaveLen(3))
-						Expect(cmds[1].String()).To(Equal("ping: PONG"))
-						stack = append(stack, "shard.AfterProcessPipeline")
-						return nil
+					processPipelineHook: func(hook redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+						return func(ctx context.Context, cmds []redis.Cmder) error {
+							defer GinkgoRecover()
+							// skip the connection initialization
+							if cmds[0].Name() == "hello" || cmds[0].Name() == "client" {
+								return nil
+							}
+
+							Expect(len(cmds)).To(BeNumerically(">=", 3))
+							Expect(cmds[1].String()).To(Equal("ping: "))
+							stack = append(stack, "shard.BeforeProcessPipeline")
+
+							err := hook(ctx, cmds)
+
+							Expect(len(cmds)).To(BeNumerically(">=", 3))
+							Expect(cmds[1].String()).To(Equal("ping: PONG"))
+							stack = append(stack, "shard.AfterProcessPipeline")
+
+							return err
+						}
 					},
 				})
 				return nil
@@ -641,5 +801,127 @@ var _ = Describe("Ring Tx timeout", func() {
 		})
 
 		testTimeout()
+	})
+})
+
+var _ = Describe("Ring Publish/Subscribe sharding", func() {
+	var ring *redis.Ring
+
+	BeforeEach(func() {
+		ring = redis.NewRing(redisRingOptions())
+	})
+
+	AfterEach(func() {
+		Expect(ring.Close()).NotTo(HaveOccurred())
+	})
+
+	It("routes Publish to the same shard as Subscribe for a given channel", func() {
+		// Use many channels to test to make sure there isn't flakiness in the case this would fail.
+		// Because the default sharding (Ring.sharding.Random) is determined by a random function,
+		// we want to make sure there isn't an inconsistency in the failure case
+		const numChannels = 20
+
+		for i := 0; i < numChannels; i++ {
+			channel := fmt.Sprintf("ring-pubsub-test-channel-%d", i)
+
+			pubsub := ring.Subscribe(ctx, channel)
+
+			_, err := pubsub.Receive(ctx)
+			Expect(err).NotTo(HaveOccurred())
+
+			n, err := ring.Publish(ctx, channel, "hello").Result()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(n).To(Equal(int64(1)), "channel %s: message should reach the subscriber's shard", channel)
+
+			Eventually(func() interface{} {
+				msg, _ := pubsub.ReceiveTimeout(ctx, time.Second)
+				m, _ := msg.(*redis.Message)
+				if m == nil {
+					return nil
+				}
+				return m.Payload
+			}, 5*time.Second).Should(Equal("hello"))
+
+			Expect(pubsub.Close()).NotTo(HaveOccurred())
+		}
+	})
+})
+
+var _ = Describe("Ring GetShardClients and GetShardClientForKey", func() {
+	var ring *redis.Ring
+
+	BeforeEach(func() {
+		ring = redis.NewRing(&redis.RingOptions{
+			Addrs: map[string]string{
+				"shard1": ":6379",
+				"shard2": ":6380",
+			},
+		})
+	})
+
+	AfterEach(func() {
+		Expect(ring.Close()).NotTo(HaveOccurred())
+	})
+
+	It("GetShardClients returns active shard clients", func() {
+		shards := ring.GetShardClients()
+		// Note: This test will pass even if Redis servers are not running,
+		// because GetShardClients only returns clients that are marked as "up",
+		// and newly created shards start as "up" until the first health check fails.
+
+		if len(shards) == 0 {
+			// Expected if Redis servers are not running
+			Skip("No active shards found (Redis servers not running)")
+		} else {
+			Expect(len(shards)).To(BeNumerically(">", 0))
+			for _, client := range shards {
+				Expect(client).NotTo(BeNil())
+			}
+		}
+	})
+
+	It("GetShardClientForKey returns correct shard for keys", func() {
+		testKeys := []string{"key1", "key2", "user:123", "channel:test"}
+
+		for _, key := range testKeys {
+			client, err := ring.GetShardClientForKey(key)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(client).NotTo(BeNil())
+		}
+	})
+
+	It("GetShardClientForKey is consistent for same key", func() {
+		key := "test:consistency"
+
+		// Call GetShardClientForKey multiple times with the same key
+		// Should always return the same shard
+		var firstClient *redis.Client
+		for i := 0; i < 5; i++ {
+			client, err := ring.GetShardClientForKey(key)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(client).NotTo(BeNil())
+
+			if i == 0 {
+				firstClient = client
+			} else {
+				Expect(client.String()).To(Equal(firstClient.String()))
+			}
+		}
+	})
+
+	It("GetShardClientForKey distributes keys across shards", func() {
+		testKeys := []string{"key1", "key2", "key3", "key4", "key5"}
+		shardMap := make(map[string]int)
+
+		for _, key := range testKeys {
+			client, err := ring.GetShardClientForKey(key)
+			Expect(err).NotTo(HaveOccurred())
+			shardMap[client.String()]++
+		}
+
+		// Should have at least 1 shard (could be all keys go to same shard due to hashing)
+		Expect(len(shardMap)).To(BeNumerically(">=", 1))
+		// But with multiple keys, we expect some distribution
+		Expect(len(shardMap)).To(BeNumerically("<=", 2)) // At most 2 shards (our setup)
 	})
 })

@@ -4,18 +4,23 @@ import (
 	"encoding"
 	"fmt"
 	"io"
+	"net"
 	"strconv"
 	"time"
 
-	"github.com/go-redis/redis/v8/internal/util"
+	"github.com/redis/go-redis/v9/internal/util"
 )
 
 type writer interface {
 	io.Writer
 	io.ByteWriter
-	// io.StringWriter
+	// WriteString implement io.StringWriter.
 	WriteString(s string) (n int, err error)
 }
+
+// maxInlineBulkLen is the longest bulk string value that bytes writes
+// together with its header in one Write. Longer values use a second Write.
+const maxInlineBulkLen = 128
 
 type Writer struct {
 	writer
@@ -33,8 +38,18 @@ func NewWriter(wr writer) *Writer {
 	}
 }
 
+// Reset points an existing Writer at a new destination, keeping lenBuf and
+// numBuf. It exists so callers on a hot path can pool Writers instead of
+// allocating one (plus its two scratch buffers) per use.
+//
+// Pass nil when returning a Writer to a pool so it does not retain the old
+// destination.
+func (w *Writer) Reset(wr writer) {
+	w.writer = wr
+}
+
 func (w *Writer) WriteArgs(args []interface{}) error {
-	if err := w.WriteByte(ArrayReply); err != nil {
+	if err := w.WriteByte(RespArray); err != nil {
 		return err
 	}
 
@@ -64,46 +79,141 @@ func (w *Writer) WriteArg(v interface{}) error {
 		return w.string("")
 	case string:
 		return w.string(v)
+	case *string:
+		if v == nil {
+			return w.string("")
+		}
+		return w.string(*v)
 	case []byte:
 		return w.bytes(v)
 	case int:
 		return w.int(int64(v))
+	case *int:
+		if v == nil {
+			return w.int(0)
+		}
+		return w.int(int64(*v))
 	case int8:
 		return w.int(int64(v))
+	case *int8:
+		if v == nil {
+			return w.int(0)
+		}
+		return w.int(int64(*v))
 	case int16:
 		return w.int(int64(v))
+	case *int16:
+		if v == nil {
+			return w.int(0)
+		}
+		return w.int(int64(*v))
 	case int32:
 		return w.int(int64(v))
+	case *int32:
+		if v == nil {
+			return w.int(0)
+		}
+		return w.int(int64(*v))
 	case int64:
 		return w.int(v)
+	case *int64:
+		if v == nil {
+			return w.int(0)
+		}
+		return w.int(*v)
 	case uint:
 		return w.uint(uint64(v))
+	case *uint:
+		if v == nil {
+			return w.uint(0)
+		}
+		return w.uint(uint64(*v))
 	case uint8:
 		return w.uint(uint64(v))
+	case *uint8:
+		if v == nil {
+			return w.uint(0)
+		}
+		return w.uint(uint64(*v))
 	case uint16:
 		return w.uint(uint64(v))
+	case *uint16:
+		if v == nil {
+			return w.uint(0)
+		}
+		return w.uint(uint64(*v))
 	case uint32:
 		return w.uint(uint64(v))
+	case *uint32:
+		if v == nil {
+			return w.uint(0)
+		}
+		return w.uint(uint64(*v))
 	case uint64:
 		return w.uint(v)
+	case *uint64:
+		if v == nil {
+			return w.uint(0)
+		}
+		return w.uint(*v)
+	case uintptr:
+		return w.uint(uint64(v))
+	case *uintptr:
+		if v == nil {
+			return w.uint(0)
+		}
+		return w.uint(uint64(*v))
 	case float32:
 		return w.float(float64(v))
+	case *float32:
+		if v == nil {
+			return w.float(0)
+		}
+		return w.float(float64(*v))
 	case float64:
 		return w.float(v)
+	case *float64:
+		if v == nil {
+			return w.float(0)
+		}
+		return w.float(*v)
 	case bool:
 		if v {
+			return w.int(1)
+		}
+		return w.int(0)
+	case *bool:
+		if v == nil {
+			return w.int(0)
+		}
+		if *v {
 			return w.int(1)
 		}
 		return w.int(0)
 	case time.Time:
 		w.numBuf = v.AppendFormat(w.numBuf[:0], time.RFC3339Nano)
 		return w.bytes(w.numBuf)
+	case *time.Time:
+		if v == nil {
+			v = &time.Time{}
+		}
+		w.numBuf = v.AppendFormat(w.numBuf[:0], time.RFC3339Nano)
+		return w.bytes(w.numBuf)
+	case time.Duration:
+		return w.int(v.Nanoseconds())
+	case *time.Duration:
+		if v == nil {
+			return w.int(0)
+		}
+		return w.int(v.Nanoseconds())
 	case encoding.BinaryMarshaler:
 		b, err := v.MarshalBinary()
 		if err != nil {
 			return err
 		}
 		return w.bytes(b)
+	case net.IP:
+		return w.bytes(v)
 	default:
 		return fmt.Errorf(
 			"redis: can't marshal %T (implement encoding.BinaryMarshaler)", v)
@@ -111,11 +221,19 @@ func (w *Writer) WriteArg(v interface{}) error {
 }
 
 func (w *Writer) bytes(b []byte) error {
-	if err := w.WriteByte(StringReply); err != nil {
+	w.lenBuf = append(w.lenBuf[:0], RespString)
+	w.lenBuf = strconv.AppendUint(w.lenBuf, uint64(len(b)), 10)
+	w.lenBuf = append(w.lenBuf, '\r', '\n')
+
+	// Short values go out with the header in one Write.
+	if len(b) <= maxInlineBulkLen {
+		w.lenBuf = append(w.lenBuf, b...)
+		w.lenBuf = append(w.lenBuf, '\r', '\n')
+		_, err := w.Write(w.lenBuf)
 		return err
 	}
 
-	if err := w.writeLen(len(b)); err != nil {
+	if _, err := w.Write(w.lenBuf); err != nil {
 		return err
 	}
 

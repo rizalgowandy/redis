@@ -3,48 +3,69 @@ package redis_test
 import (
 	"context"
 	"fmt"
+	"net"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
 )
 
 type redisHook struct{}
 
 var _ redis.Hook = redisHook{}
 
-func (redisHook) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
-	fmt.Printf("starting processing: <%s>\n", cmd)
-	return ctx, nil
+func (redisHook) DialHook(hook redis.DialHook) redis.DialHook {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		fmt.Printf("dialing %s %s\n", network, addr)
+		conn, err := hook(ctx, network, addr)
+		fmt.Printf("finished dialing %s %s\n", network, addr)
+		return conn, err
+	}
 }
 
-func (redisHook) AfterProcess(ctx context.Context, cmd redis.Cmder) error {
-	fmt.Printf("finished processing: <%s>\n", cmd)
-	return nil
+func (redisHook) ProcessHook(hook redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		fmt.Printf("starting processing: <%v>\n", cmd.Args())
+		err := hook(ctx, cmd)
+		fmt.Printf("finished processing: <%v>\n", cmd.Args())
+		return err
+	}
 }
 
-func (redisHook) BeforeProcessPipeline(ctx context.Context, cmds []redis.Cmder) (context.Context, error) {
-	fmt.Printf("pipeline starting processing: %v\n", cmds)
-	return ctx, nil
-}
-
-func (redisHook) AfterProcessPipeline(ctx context.Context, cmds []redis.Cmder) error {
-	fmt.Printf("pipeline finished processing: %v\n", cmds)
-	return nil
+func (redisHook) ProcessPipelineHook(hook redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		names := make([]string, 0, len(cmds))
+		for _, cmd := range cmds {
+			names = append(names, fmt.Sprintf("%v", cmd.Args()))
+		}
+		fmt.Printf("pipeline starting processing: %v\n", names)
+		err := hook(ctx, cmds)
+		fmt.Printf("pipeline finished processing: %v\n", names)
+		return err
+	}
 }
 
 func Example_instrumentation() {
 	rdb := redis.NewClient(&redis.Options{
-		Addr: ":6379",
+		Addr:            ":6379",
+		DisableIdentity: true,
 	})
 	rdb.AddHook(redisHook{})
 
 	rdb.Ping(ctx)
-	// Output: starting processing: <ping: >
-	// finished processing: <ping: PONG>
+	// Output:
+	// starting processing: <[ping]>
+	// dialing tcp :6379
+	// finished dialing tcp :6379
+	// starting processing: <[hello 3]>
+	// finished processing: <[hello 3]>
+	// starting processing: <[client maint_notifications on moving-endpoint-type internal-ip]>
+	// finished processing: <[client maint_notifications on moving-endpoint-type internal-ip]>
+	// finished processing: <[ping]>
 }
 
 func ExamplePipeline_instrumentation() {
 	rdb := redis.NewClient(&redis.Options{
-		Addr: ":6379",
+		Addr:            ":6379",
+		DisableIdentity: true,
 	})
 	rdb.AddHook(redisHook{})
 
@@ -53,13 +74,21 @@ func ExamplePipeline_instrumentation() {
 		pipe.Ping(ctx)
 		return nil
 	})
-	// Output: pipeline starting processing: [ping:  ping: ]
-	// pipeline finished processing: [ping: PONG ping: PONG]
+	// Output:
+	// pipeline starting processing: [[ping] [ping]]
+	// dialing tcp :6379
+	// finished dialing tcp :6379
+	// starting processing: <[hello 3]>
+	// finished processing: <[hello 3]>
+	// starting processing: <[client maint_notifications on moving-endpoint-type internal-ip]>
+	// finished processing: <[client maint_notifications on moving-endpoint-type internal-ip]>
+	// pipeline finished processing: [[ping] [ping]]
 }
 
 func ExampleClient_Watch_instrumentation() {
 	rdb := redis.NewClient(&redis.Options{
-		Addr: ":6379",
+		Addr:            ":6379",
+		DisableIdentity: true,
 	})
 	rdb.AddHook(redisHook{})
 
@@ -69,12 +98,18 @@ func ExampleClient_Watch_instrumentation() {
 		return nil
 	}, "foo")
 	// Output:
-	// starting processing: <watch foo: >
-	// finished processing: <watch foo: OK>
-	// starting processing: <ping: >
-	// finished processing: <ping: PONG>
-	// starting processing: <ping: >
-	// finished processing: <ping: PONG>
-	// starting processing: <unwatch: >
-	// finished processing: <unwatch: OK>
+	// starting processing: <[watch foo]>
+	// dialing tcp :6379
+	// finished dialing tcp :6379
+	// starting processing: <[hello 3]>
+	// finished processing: <[hello 3]>
+	// starting processing: <[client maint_notifications on moving-endpoint-type internal-ip]>
+	// finished processing: <[client maint_notifications on moving-endpoint-type internal-ip]>
+	// finished processing: <[watch foo]>
+	// starting processing: <[ping]>
+	// finished processing: <[ping]>
+	// starting processing: <[ping]>
+	// finished processing: <[ping]>
+	// starting processing: <[unwatch]>
+	// finished processing: <[unwatch]>
 }

@@ -1,9 +1,22 @@
-module github.com/go-redis/redis/extra/rediscmd/v8
+module github.com/redis/go-redis/extra/rediscmd/v9
 
-go 1.15
+go 1.26.0
+
+replace github.com/redis/go-redis/v9 => ../..
 
 require (
-	github.com/go-redis/redis/v8 v8.4.4
-	github.com/onsi/ginkgo v1.15.0
-	github.com/onsi/gomega v1.10.5
+	github.com/bsm/ginkgo/v2 v2.12.0
+	github.com/bsm/gomega v1.27.10
+	github.com/redis/go-redis/v9 v9.23.0
+)
+
+require (
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	go.uber.org/atomic v1.12.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+)
+
+retract (
+	v9.7.2 // This version was accidentally released. Please use version 9.7.3 instead.
+	v9.5.3 // This version was accidentally released. Please use version 9.6.0 instead.
 )

@@ -1,11 +1,25 @@
-module github.com/go-redis/redis/extra/rediscensus/v8
+module github.com/redis/go-redis/extra/rediscensus/v9
 
-go 1.15
+go 1.26.0
 
-replace github.com/go-redis/redis/extra/rediscmd/v8 => ../rediscmd
+replace github.com/redis/go-redis/v9 => ../..
+
+replace github.com/redis/go-redis/extra/rediscmd/v9 => ../rediscmd
 
 require (
-	github.com/go-redis/redis/extra/rediscmd/v8 v8.8.2
-	github.com/go-redis/redis/v8 v8.8.2
-	go.opencensus.io v0.22.6
+	github.com/redis/go-redis/extra/rediscmd/v9 v9.23.0
+	github.com/redis/go-redis/v9 v9.23.0
+	go.opencensus.io v0.24.0
+)
+
+require (
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
+	go.uber.org/atomic v1.12.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+)
+
+retract (
+	v9.7.2 // This version was accidentally released. Please use version 9.7.3 instead.
+	v9.5.3 // This version was accidentally released. Please use version 9.6.0 instead.
 )

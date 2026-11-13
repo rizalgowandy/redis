@@ -1,6 +1,7 @@
 package hscan
 
 import (
+	"encoding"
 	"fmt"
 	"reflect"
 	"strings"
@@ -39,12 +40,12 @@ func (s *structSpec) set(tag string, sf *structField) {
 }
 
 func newStructSpec(t reflect.Type, fieldTag string) *structSpec {
+	numField := t.NumField()
 	out := &structSpec{
-		m: make(map[string]*structField),
+		m: make(map[string]*structField, numField),
 	}
 
-	num := t.NumField()
-	for i := 0; i < num; i++ {
+	for i := 0; i < numField; i++ {
 		f := t.Field(i)
 
 		tag := f.Tag.Get(fieldTag)
@@ -58,7 +59,11 @@ func newStructSpec(t reflect.Type, fieldTag string) *structSpec {
 		}
 
 		// Use the built-in decoder.
-		out.set(tag, &structField{index: i, fn: decoders[f.Type.Kind()]})
+		kind := f.Type.Kind()
+		if kind == reflect.Pointer {
+			kind = f.Type.Elem().Kind()
+		}
+		out.set(tag, &structField{index: i, fn: decoders[kind]})
 	}
 
 	return out
@@ -84,10 +89,53 @@ func (s StructValue) Scan(key string, value string) error {
 	if !ok {
 		return nil
 	}
-	if err := field.fn(s.value.Field(field.index), value); err != nil {
+
+	v := s.value.Field(field.index)
+	if !v.CanSet() {
 		t := s.value.Type()
-		return fmt.Errorf("cannot scan redis.result %s into struct field %s.%s of type %s, error-%s",
-			value, t.Name(), t.Field(field.index).Name, t.Field(field.index).Type, err.Error())
+		return fmt.Errorf("redis.Scan(unexported field %s.%s)", t.Name(), t.Field(field.index).Name)
+	}
+	if v.Kind() == reflect.Pointer && v.IsNil() {
+		ptr := reflect.New(v.Type().Elem())
+		if err := s.decode(field, ptr, value); err != nil {
+			return err
+		}
+		v.Set(ptr)
+		return nil
+	}
+
+	return s.decode(field, v, value)
+}
+
+func (s StructValue) decode(field *structField, v reflect.Value, value string) error {
+	isPtr := v.Kind() == reflect.Pointer
+	if !isPtr && v.Type().Name() != "" && v.CanAddr() {
+		v = v.Addr()
+		isPtr = true
+	}
+
+	if isPtr && v.Type().NumMethod() > 0 && v.CanInterface() {
+		switch scan := v.Interface().(type) {
+		case Scanner:
+			return scan.ScanRedis(value)
+		case encoding.TextUnmarshaler:
+			// Copy: both contracts allow decoding in place, so the bytes must
+			// not alias value's backing array (internal/proto.Scan copies
+			// before UnmarshalBinary for the same reason).
+			return scan.UnmarshalText([]byte(value))
+		case encoding.BinaryUnmarshaler:
+			return scan.UnmarshalBinary([]byte(value))
+		}
+	}
+
+	if isPtr {
+		v = v.Elem()
+	}
+
+	if err := field.fn(v, value); err != nil {
+		t := s.value.Type()
+		return fmt.Errorf("cannot scan redis.result %s into struct field %s.%s of type %s, error-%w",
+			value, t.Name(), t.Field(field.index).Name, t.Field(field.index).Type, err)
 	}
 	return nil
 }

@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
 )
 
 var (
@@ -39,13 +39,14 @@ func ExampleNewClient() {
 }
 
 func ExampleParseURL() {
-	opt, err := redis.ParseURL("redis://:qwerty@localhost:6379/1")
+	opt, err := redis.ParseURL("redis://:qwerty@localhost:6379/1?dial_timeout=5s")
 	if err != nil {
 		panic(err)
 	}
 	fmt.Println("addr is", opt.Addr)
 	fmt.Println("db is", opt.DB)
 	fmt.Println("password is", opt.Password)
+	fmt.Println("dial timeout is", opt.DialTimeout)
 
 	// Create client as usually.
 	_ = redis.NewClient(opt)
@@ -53,10 +54,11 @@ func ExampleParseURL() {
 	// Output: addr is localhost:6379
 	// db is 1
 	// password is qwerty
+	// dial timeout is 5s
 }
 
 func ExampleNewFailoverClient() {
-	// See http://redis.io/topics/sentinel for instructions how to
+	// See https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel for instructions how to
 	// setup Redis Sentinel.
 	rdb := redis.NewFailoverClient(&redis.FailoverOptions{
 		MasterName:    "master",
@@ -66,7 +68,7 @@ func ExampleNewFailoverClient() {
 }
 
 func ExampleNewClusterClient() {
-	// See http://redis.io/topics/cluster-tutorial for instructions
+	// See https://redis.io/docs/latest/operate/oss_and_stack/management/scaling for instructions
 	// how to setup Redis Cluster.
 	rdb := redis.NewClusterClient(&redis.ClusterOptions{
 		Addrs: []string{":7000", ":7001", ":7002", ":7003", ":7004", ":7005"},
@@ -152,8 +154,8 @@ func ExampleClient() {
 	// missing_key does not exist
 }
 
-func ExampleConn() {
-	conn := rdb.Conn(context.Background())
+func ExampleConn_name() {
+	conn := rdb.Conn()
 
 	err := conn.ClientSetName(ctx, "foobar").Err()
 	if err != nil {
@@ -173,6 +175,28 @@ func ExampleConn() {
 	// Output: foobar
 }
 
+func ExampleConn_client_setInfo_libraryVersion() {
+	conn := rdb.Conn()
+
+	err := conn.ClientSetInfo(ctx, redis.WithLibraryVersion("1.2.3")).Err()
+	if err != nil {
+		panic(err)
+	}
+
+	// Open other connections.
+	for i := 0; i < 10; i++ {
+		go rdb.Ping(ctx)
+	}
+
+	s, err := conn.ClientInfo(ctx).Result()
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println(s.LibVer)
+	// Output: 1.2.3
+}
+
 func ExampleClient_Set() {
 	// Last argument is expiration. Zero means the key has no
 	// expiration time.
@@ -188,8 +212,23 @@ func ExampleClient_Set() {
 	}
 }
 
-func ExampleClient_SetEX() {
-	err := rdb.SetEX(ctx, "key", "value", time.Hour).Err()
+func ExampleClient_SetEx() {
+	err := rdb.SetEx(ctx, "key", "value", time.Hour).Err()
+	if err != nil {
+		panic(err)
+	}
+}
+
+func ExampleClient_HSet() {
+	// Set "redis" tag for hash key
+	type ExampleUser struct {
+		Name string `redis:"name"`
+		Age  int    `redis:"age"`
+	}
+
+	items := ExampleUser{"jane", 22}
+
+	err := rdb.HSet(ctx, "user:1", items).Err()
 	if err != nil {
 		panic(err)
 	}
@@ -210,7 +249,7 @@ func ExampleClient_BLPop() {
 		panic(err)
 	}
 
-	// use `rdb.BLPop(0, "queue")` for infinite waiting time
+	// use `rdb.BLPop(ctx, 0, "queue")` for infinite waiting time
 	result, err := rdb.BLPop(ctx, 1*time.Second, "queue").Result()
 	if err != nil {
 		panic(err)
@@ -276,9 +315,38 @@ func ExampleClient_ScanType() {
 	// Output: found 33 keys
 }
 
-// ExampleStringStringMapCmd_Scan shows how to scan the results of a map fetch
+// ExampleClient_ScanType_hashType uses the keyType "hash".
+func ExampleClient_ScanType_hashType() {
+	rdb.FlushDB(ctx)
+	for i := 0; i < 33; i++ {
+		err := rdb.HSet(context.TODO(), fmt.Sprintf("key%d", i), "value", "foo").Err()
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	var allKeys []string
+	var cursor uint64
+	var err error
+
+	for {
+		var keysFromScan []string
+		keysFromScan, cursor, err = rdb.ScanType(context.TODO(), cursor, "key*", 10, "hash").Result()
+		if err != nil {
+			panic(err)
+		}
+		allKeys = append(allKeys, keysFromScan...)
+		if cursor == 0 {
+			break
+		}
+	}
+	fmt.Printf("%d keys ready for use", len(allKeys))
+	// Output: 33 keys ready for use
+}
+
+// ExampleMapStringStringCmd_Scan shows how to scan the results of a map fetch
 // into a struct.
-func ExampleStringStringMapCmd_Scan() {
+func ExampleMapStringStringCmd_Scan() {
 	rdb.FlushDB(ctx)
 	err := rdb.HMSet(ctx, "map",
 		"name", "hello",
@@ -291,7 +359,7 @@ func ExampleStringStringMapCmd_Scan() {
 	// Get the map. The same approach works for HmGet().
 	res := rdb.HGetAll(ctx, "map")
 	if res.Err() != nil {
-		panic(err)
+		panic(res.Err())
 	}
 
 	type data struct {
@@ -324,7 +392,7 @@ func ExampleSliceCmd_Scan() {
 
 	res := rdb.MGet(ctx, "name", "count", "empty", "correct")
 	if res.Err() != nil {
-		panic(err)
+		panic(res.Err())
 	}
 
 	type data struct {
@@ -402,7 +470,7 @@ func ExampleClient_TxPipeline() {
 }
 
 func ExampleClient_Watch() {
-	const maxRetries = 1000
+	const maxRetries = 10000
 
 	// Increment transactionally increments key using GET and SET commands.
 	increment := func(key string) error {
@@ -414,10 +482,10 @@ func ExampleClient_Watch() {
 				return err
 			}
 
-			// Actual opperation (local in optimistic lock).
+			// Actual operation (local in optimistic lock).
 			n++
 
-			// Operation is commited only if the watched keys remain unchanged.
+			// Operation is committed only if the watched keys remain unchanged.
 			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 				pipe.Set(ctx, key, n, 0)
 				return nil
@@ -564,8 +632,8 @@ func Example_customCommand2() {
 
 func ExampleScanIterator() {
 	iter := rdb.Scan(ctx, 0, "", 0).Iterator()
-	for iter.Next(ctx) {
-		fmt.Println(iter.Val())
+	for val := range iter.Vals(ctx) {
+		fmt.Println(val)
 	}
 	if err := iter.Err(); err != nil {
 		panic(err)
@@ -574,8 +642,8 @@ func ExampleScanIterator() {
 
 func ExampleScanCmd_Iterator() {
 	iter := rdb.Scan(ctx, 0, "", 0).Iterator()
-	for iter.Next(ctx) {
-		fmt.Println(iter.Val())
+	for val := range iter.Vals(ctx) {
+		fmt.Println(val)
 	}
 	if err := iter.Err(); err != nil {
 		panic(err)
@@ -611,11 +679,16 @@ func ExampleNewUniversalClient_cluster() {
 }
 
 func ExampleClient_SlowLogGet() {
+	if RECluster {
+		// skip slowlog test for cluster
+		fmt.Println(2)
+		return
+	}
 	const key = "slowlog-log-slower-than"
 
 	old := rdb.ConfigGet(ctx, key).Val()
 	rdb.ConfigSet(ctx, key, "0")
-	defer rdb.ConfigSet(ctx, key, old[1].(string))
+	defer rdb.ConfigSet(ctx, key, old[key])
 
 	if err := rdb.Do(ctx, "slowlog", "reset").Err(); err != nil {
 		panic(err)

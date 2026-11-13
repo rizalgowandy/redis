@@ -4,9 +4,12 @@ import (
 	"math"
 	"strconv"
 	"testing"
+	"time"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	. "github.com/bsm/ginkgo/v2"
+	. "github.com/bsm/gomega"
+
+	"github.com/redis/go-redis/v9/internal/util"
 )
 
 type data struct {
@@ -28,6 +31,70 @@ type data struct {
 	Float   float32 `redis:"float"`
 	Float64 float64 `redis:"float64"`
 	Bool    bool    `redis:"bool"`
+	BoolRef *bool   `redis:"boolRef"`
+}
+
+type TimeRFC3339Nano struct {
+	time.Time
+}
+
+func (t *TimeRFC3339Nano) ScanRedis(s string) (err error) {
+	t.Time, err = time.Parse(time.RFC3339Nano, s)
+	return
+}
+
+type TimeData struct {
+	Name string           `redis:"name"`
+	Time *TimeRFC3339Nano `redis:"login"`
+}
+
+type binaryUnmarshaler struct {
+	s string
+}
+
+func (b *binaryUnmarshaler) UnmarshalBinary(data []byte) error {
+	b.s = string(data)
+	return nil
+}
+
+type BinaryData struct {
+	Binary *binaryUnmarshaler `redis:"binary"`
+}
+
+// inPlaceUnmarshaler decodes in place, which both encoding.BinaryUnmarshaler
+// and encoding.TextUnmarshaler allow: their contracts only forbid RETAINING
+// the slice, not writing to it (base64.Decode(b, b) is the canonical example).
+type inPlaceUnmarshaler struct {
+	s string
+}
+
+func (u *inPlaceUnmarshaler) UnmarshalBinary(data []byte) error {
+	lowerInPlace(data)
+	u.s = string(data)
+	return nil
+}
+
+type inPlaceTextUnmarshaler struct {
+	s string
+}
+
+func (u *inPlaceTextUnmarshaler) UnmarshalText(data []byte) error {
+	lowerInPlace(data)
+	u.s = string(data)
+	return nil
+}
+
+func lowerInPlace(b []byte) {
+	for i := range b {
+		if b[i] >= 'A' && b[i] <= 'Z' {
+			b[i] += 'a' - 'A'
+		}
+	}
+}
+
+type InPlaceData struct {
+	Binary *inPlaceUnmarshaler     `redis:"binary"`
+	Text   *inPlaceTextUnmarshaler `redis:"text"`
 }
 
 type i []interface{}
@@ -69,7 +136,7 @@ var _ = Describe("Scan", func() {
 			Expect(Scan(&d, i{v}, i{vals[k]})).To(HaveOccurred())
 		}
 
-		//success
+		// success
 		f = func(v uint64) string {
 			return strconv.FormatUint(v, 10)
 		}
@@ -102,10 +169,10 @@ var _ = Describe("Scan", func() {
 		Expect(Scan(&d, i{"key"}, i{"value"})).NotTo(HaveOccurred())
 		Expect(d).To(Equal(data{}))
 
-		keys := i{"string", "byte", "int", "int64", "uint", "uint64", "float", "float64", "bool"}
+		keys := i{"string", "byte", "int", "int64", "uint", "uint64", "float", "float64", "bool", "boolRef"}
 		vals := i{
 			"str!", "bytes!", "123", "123456789123456789", "456", "987654321987654321",
-			"123.456", "123456789123456789.987654321987654321", "1",
+			"123.456", "123456789123456789.987654321987654321", "1", "1",
 		}
 		Expect(Scan(&d, keys, vals)).NotTo(HaveOccurred())
 		Expect(d).To(Equal(data{
@@ -118,6 +185,7 @@ var _ = Describe("Scan", func() {
 			Float:   123.456,
 			Float64: 1.2345678912345678e+17,
 			Bool:    true,
+			BoolRef: util.ToPtr(true),
 		}))
 
 		// Scan a different type with the same values to test that
@@ -152,6 +220,7 @@ var _ = Describe("Scan", func() {
 			Float:   1.0,
 			Float64: 1.2345678912345678e+17,
 			Bool:    true,
+			BoolRef: util.ToPtr(true),
 		}))
 	})
 
@@ -164,6 +233,62 @@ var _ = Describe("Scan", func() {
 		}))
 	})
 
+	It("scans the remaining fields after a bad value", func() {
+		var d data
+
+		Expect(Scan(&d, i{"bool", "string", "int"}, i{"-1", "str!", "123"})).To(HaveOccurred())
+		Expect(d).To(Equal(data{
+			String: "str!",
+			Int:    123,
+		}))
+	})
+
+	It("leaves nil pointers nil on bad values", func() {
+		var d data
+		Expect(Scan(&d, i{"boolRef"}, i{"abc"})).To(HaveOccurred())
+		Expect(d.BoolRef).To(BeNil())
+
+		var td TimeData
+		Expect(Scan(&td, i{"login"}, i{"abc"})).To(HaveOccurred())
+		Expect(td.Time).To(BeNil())
+	})
+
+	It("returns the first error when a later field can't be set", func() {
+		type withUintptr struct {
+			A int     `redis:"a"`
+			P uintptr `redis:"p"`
+		}
+		type withUnexported struct {
+			A int    `redis:"a"`
+			b string `redis:"b"`
+		}
+		type withUnexportedPtr struct {
+			A int     `redis:"a"`
+			b *string `redis:"b"`
+		}
+		type withUnexportedBytes struct {
+			A int    `redis:"a"`
+			b []byte `redis:"b"`
+		}
+		type withString struct {
+			A int    `redis:"a"`
+			B string `redis:"b"`
+		}
+
+		for _, dst := range []interface{}{
+			&withUintptr{}, &withUnexported{}, &withUnexportedPtr{},
+			&withUnexportedBytes{}, &withString{},
+		} {
+			err := Scan(dst, i{"a", "b", "p"}, i{"x", "1", "1"})
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring(".A of type int"))
+		}
+
+		var u withUnexported
+		Expect(Scan(&u, i{"b"}, i{"1"})).To(HaveOccurred())
+		Expect(u.b).To(BeEmpty())
+	})
+
 	It("catches bad values", func() {
 		var d data
 
@@ -174,5 +299,61 @@ var _ = Describe("Scan", func() {
 		Expect(Scan(&d, i{"bool"}, i{"-1"})).To(HaveOccurred())
 		Expect(Scan(&d, i{"bool"}, i{""})).To(HaveOccurred())
 		Expect(Scan(&d, i{"bool"}, i{"123"})).To(HaveOccurred())
+	})
+
+	It("does not stop scanning on first failure", func() {
+		var d data
+
+		keys := i{"bool", "string", "int"}
+		vals := i{"-1", "foobar", "123"}
+
+		err := Scan(&d, keys, vals)
+		Expect(err).To(HaveOccurred())
+
+		Expect(d).To(Equal(data{
+			Bool:   false,
+			String: "foobar",
+			Int:    123,
+		}))
+	})
+
+	It("Implements Scanner", func() {
+		var td TimeData
+
+		now := time.Now()
+		Expect(Scan(&td, i{"name", "login"}, i{"hello", now.Format(time.RFC3339Nano)})).NotTo(HaveOccurred())
+		Expect(td.Name).To(Equal("hello"))
+		Expect(td.Time.UnixNano()).To(Equal(now.UnixNano()))
+		Expect(td.Time.Format(time.RFC3339Nano)).To(Equal(now.Format(time.RFC3339Nano)))
+	})
+
+	It("should time.Time RFC3339Nano", func() {
+		type TimeTime struct {
+			Time time.Time `redis:"time"`
+		}
+
+		now := time.Now()
+
+		var tt TimeTime
+		Expect(Scan(&tt, i{"time"}, i{now.Format(time.RFC3339Nano)})).NotTo(HaveOccurred())
+		Expect(now.Unix()).To(Equal(tt.Time.Unix()))
+	})
+	It("Implements BinaryUnmarshaler", func() {
+		var bd BinaryData
+		Expect(Scan(&bd, i{"binary"}, i{"hello"})).NotTo(HaveOccurred())
+		Expect(bd.Binary.s).To(Equal("hello"))
+	})
+
+	It("does not expose the value to an in-place unmarshaler", func() {
+		// Built at run time so the write lands on heap memory: a string in
+		// read-only memory faults the process instead, which a spec cannot
+		// assert on.
+		val := string([]byte("HELLO"))
+
+		var d InPlaceData
+		Expect(Scan(&d, i{"binary", "text"}, i{val, val})).NotTo(HaveOccurred())
+		Expect(d.Binary.s).To(Equal("hello"))
+		Expect(d.Text.s).To(Equal("hello"))
+		Expect(val).To(Equal("HELLO"))
 	})
 })

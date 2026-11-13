@@ -5,21 +5,28 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/cespare/xxhash/v2"
-	"github.com/dgryski/go-rendezvous"
-	"github.com/go-redis/redis/v8/internal"
-	"github.com/go-redis/redis/v8/internal/hashtag"
-	"github.com/go-redis/redis/v8/internal/pool"
-	"github.com/go-redis/redis/v8/internal/rand"
+	"github.com/redis/go-redis/v9/auth"
+	"github.com/redis/go-redis/v9/internal"
+	"github.com/redis/go-redis/v9/internal/hashtag"
+	"github.com/redis/go-redis/v9/internal/otel"
+	"github.com/redis/go-redis/v9/internal/pool"
+	"github.com/redis/go-redis/v9/internal/proto"
 )
 
 var errRingShardsDown = errors.New("redis: all ring shards are down")
+
+// defaultHeartbeatFn is the default function used to check the shard liveness
+var defaultHeartbeatFn = func(ctx context.Context, client *Client) bool {
+	err := client.Ping(ctx).Err()
+	return err == nil || err == pool.ErrPoolTimeout
+}
 
 //------------------------------------------------------------------------------
 
@@ -27,16 +34,8 @@ type ConsistentHash interface {
 	Get(string) string
 }
 
-type rendezvousWrapper struct {
-	*rendezvous.Rendezvous
-}
-
-func (w rendezvousWrapper) Get(key string) string {
-	return w.Lookup(key)
-}
-
 func newRendezvous(shards []string) ConsistentHash {
-	return rendezvousWrapper{rendezvous.New(shards, xxhash.Sum64String)}
+	return hashtag.NewRendezvousHash(shards)
 }
 
 //------------------------------------------------------------------------------
@@ -47,12 +46,23 @@ type RingOptions struct {
 	// Map of name => host:port addresses of ring shards.
 	Addrs map[string]string
 
-	// NewClient creates a shard client with provided name and options.
-	NewClient func(name string, opt *Options) *Client
+	// NewClient creates a shard client with provided options.
+	NewClient func(opt *Options) *Client
 
-	// Frequency of PING commands sent to check shards availability.
+	// himport is the ring-wide HIMPORT fieldset registry, set by NewRing and
+	// shared with every shard client (see himport.go, himport_cluster.go).
+	himport *himportRegistry
+
+	// ClientName will execute the `CLIENT SETNAME ClientName` command for each conn.
+	ClientName string
+
+	// Frequency of executing HeartbeatFn to check shards availability.
 	// Shard is considered down after 3 subsequent failed checks.
 	HeartbeatFrequency time.Duration
+
+	// A function used to check the shard liveness
+	// if not set, defaults to defaultHeartbeatFn
+	HeartbeatFn func(ctx context.Context, client *Client) bool
 
 	// NewConsistentHash returns a consistent hash that is used
 	// to distribute keys across the shards.
@@ -66,32 +76,120 @@ type RingOptions struct {
 	Dialer    func(ctx context.Context, network, addr string) (net.Conn, error)
 	OnConnect func(ctx context.Context, cn *Conn) error
 
+	Protocol int
 	Username string
 	Password string
-	DB       int
+	// AuthEmptyPassword: see Options.AuthEmptyPassword.
+	AuthEmptyPassword bool
+	// CredentialsProvider allows the username and password to be updated
+	// before reconnecting. It should return the current username and password.
+	CredentialsProvider func() (username string, password string)
+
+	// CredentialsProviderContext is an enhanced parameter of CredentialsProvider,
+	// done to maintain API compatibility. In the future,
+	// there might be a merge between CredentialsProviderContext and CredentialsProvider.
+	// There will be a conflict between them; if CredentialsProviderContext exists, we will ignore CredentialsProvider.
+	CredentialsProviderContext func(ctx context.Context) (username string, password string, err error)
+
+	// StreamingCredentialsProvider is used to retrieve the credentials
+	// for the connection from an external source. Those credentials may change
+	// during the connection lifetime. This is useful for managed identity
+	// scenarios where the credentials are retrieved from an external source.
+	//
+	// Currently, this is a placeholder for the future implementation.
+	StreamingCredentialsProvider auth.StreamingCredentialsProvider
+	DB                           int
 
 	MaxRetries      int
 	MinRetryBackoff time.Duration
 	MaxRetryBackoff time.Duration
 
-	DialTimeout  time.Duration
-	ReadTimeout  time.Duration
-	WriteTimeout time.Duration
+	DialTimeout time.Duration
 
-	PoolSize           int
-	MinIdleConns       int
-	MaxConnAge         time.Duration
-	PoolTimeout        time.Duration
-	IdleTimeout        time.Duration
-	IdleCheckFrequency time.Duration
+	// DialerRetries is the maximum number of retry attempts when dialing fails.
+	//
+	// default: 5
+	DialerRetries int
+
+	// DialerRetryTimeout is the backoff duration between retry attempts.
+	//
+	// default: 100 milliseconds
+	DialerRetryTimeout time.Duration
+
+	// DialerRetryBackoff controls the delay between dial retry attempts.
+	// See Options.DialerRetryBackoff for details.
+	DialerRetryBackoff func(attempt int) time.Duration
+
+	ReadTimeout           time.Duration
+	WriteTimeout          time.Duration
+	ContextTimeoutEnabled bool
+
+	// PoolFIFO uses FIFO mode for each node connection pool GET/PUT (default LIFO).
+	PoolFIFO bool
+
+	PoolSize              int
+	PoolTimeout           time.Duration
+	MinIdleConns          int
+	MaxIdleConns          int
+	MaxActiveConns        int
+	ConnMaxIdleTime       time.Duration
+	ConnMaxLifetime       time.Duration
+	ConnMaxLifetimeJitter time.Duration
+
+	// ReadBufferSize is the size of the bufio.Reader buffer for each connection.
+	// Larger buffers can improve performance for commands that return large responses.
+	// Smaller buffers can improve memory usage for larger pools.
+	//
+	// default: 32KiB (32768 bytes)
+	ReadBufferSize int
+
+	// WriteBufferSize is the size of the bufio.Writer buffer for each connection.
+	// Larger buffers can improve performance for large pipelines and commands with many arguments.
+	// Smaller buffers can improve memory usage for larger pools.
+	//
+	// default: 32KiB (32768 bytes)
+	WriteBufferSize int
+
+	// PipelineReadBufferSize, PipelineWriteBufferSize, PipelinePoolSize and
+	// PipelineMinIdleConns configure the separate connection pool used for
+	// pipelining on each shard, with its own (typically larger) buffers. See the
+	// same-named fields on Options for details. Each shard client (a NewClient) creates this pool by
+	// default; set PipelinePoolSize < 0 to opt out (pipelines run on the main pool).
+	PipelineReadBufferSize  int
+	PipelineWriteBufferSize int
+	PipelinePoolSize        int
+	PipelineMinIdleConns    int
 
 	TLSConfig *tls.Config
 	Limiter   Limiter
+
+	// DisableIndentity - Disable set-lib on connect.
+	//
+	// default: false
+	//
+	// Deprecated: Use DisableIdentity instead.
+	DisableIndentity bool
+
+	// DisableIdentity is used to disable CLIENT SETINFO command on connect.
+	//
+	// default: false
+	DisableIdentity bool
+	IdentitySuffix  string
+
+	// Deprecated: All RediSearch commands now have stable RESP3 parsing and this
+	// flag is a no-op. It is kept for backwards compatibility and will be removed
+	// in a future release.
+	UnstableResp3 bool
+
+	// OTelRecorder records this client's metrics instead of the global recorder
+	// installed by SetOTelRecorder. Every shard client and its pools are bound to it
+	// for their whole life. nil records to the global recorder.
+	OTelRecorder OTelRecorder
 }
 
 func (opt *RingOptions) init() {
 	if opt.NewClient == nil {
-		opt.NewClient = func(name string, opt *Options) *Client {
+		opt.NewClient = func(opt *Options) *Client {
 			return NewClient(opt)
 		}
 	}
@@ -100,53 +198,92 @@ func (opt *RingOptions) init() {
 		opt.HeartbeatFrequency = 500 * time.Millisecond
 	}
 
+	if opt.HeartbeatFn == nil {
+		opt.HeartbeatFn = defaultHeartbeatFn
+	}
+
 	if opt.NewConsistentHash == nil {
 		opt.NewConsistentHash = newRendezvous
 	}
 
-	if opt.MaxRetries == -1 {
+	switch opt.MaxRetries {
+	case -1:
 		opt.MaxRetries = 0
-	} else if opt.MaxRetries == 0 {
+	case 0:
 		opt.MaxRetries = 3
 	}
 	switch opt.MinRetryBackoff {
 	case -1:
 		opt.MinRetryBackoff = 0
 	case 0:
-		opt.MinRetryBackoff = 8 * time.Millisecond
+		opt.MinRetryBackoff = 10 * time.Millisecond
 	}
 	switch opt.MaxRetryBackoff {
 	case -1:
 		opt.MaxRetryBackoff = 0
 	case 0:
-		opt.MaxRetryBackoff = 512 * time.Millisecond
+		opt.MaxRetryBackoff = time.Second
+	}
+
+	if opt.ReadBufferSize == 0 {
+		opt.ReadBufferSize = proto.DefaultBufferSize
+	}
+	if opt.WriteBufferSize == 0 {
+		opt.WriteBufferSize = proto.DefaultBufferSize
 	}
 }
 
 func (opt *RingOptions) clientOptions() *Options {
 	return &Options{
-		Dialer:    opt.Dialer,
-		OnConnect: opt.OnConnect,
+		ClientName:   opt.ClientName,
+		Dialer:       opt.Dialer,
+		OnConnect:    opt.OnConnect,
+		OTelRecorder: opt.OTelRecorder,
 
-		Username: opt.Username,
-		Password: opt.Password,
-		DB:       opt.DB,
+		Protocol:                     opt.Protocol,
+		Username:                     opt.Username,
+		Password:                     opt.Password,
+		AuthEmptyPassword:            opt.AuthEmptyPassword,
+		CredentialsProvider:          opt.CredentialsProvider,
+		CredentialsProviderContext:   opt.CredentialsProviderContext,
+		StreamingCredentialsProvider: opt.StreamingCredentialsProvider,
+		DB:                           opt.DB,
 
 		MaxRetries: -1,
 
-		DialTimeout:  opt.DialTimeout,
-		ReadTimeout:  opt.ReadTimeout,
-		WriteTimeout: opt.WriteTimeout,
+		DialTimeout:           opt.DialTimeout,
+		DialerRetries:         opt.DialerRetries,
+		DialerRetryTimeout:    opt.DialerRetryTimeout,
+		DialerRetryBackoff:    opt.DialerRetryBackoff,
+		ReadTimeout:           opt.ReadTimeout,
+		WriteTimeout:          opt.WriteTimeout,
+		ContextTimeoutEnabled: opt.ContextTimeoutEnabled,
 
-		PoolSize:           opt.PoolSize,
-		MinIdleConns:       opt.MinIdleConns,
-		MaxConnAge:         opt.MaxConnAge,
-		PoolTimeout:        opt.PoolTimeout,
-		IdleTimeout:        opt.IdleTimeout,
-		IdleCheckFrequency: opt.IdleCheckFrequency,
+		PoolFIFO:              opt.PoolFIFO,
+		PoolSize:              opt.PoolSize,
+		PoolTimeout:           opt.PoolTimeout,
+		MinIdleConns:          opt.MinIdleConns,
+		MaxIdleConns:          opt.MaxIdleConns,
+		MaxActiveConns:        opt.MaxActiveConns,
+		ConnMaxIdleTime:       opt.ConnMaxIdleTime,
+		ConnMaxLifetime:       opt.ConnMaxLifetime,
+		ConnMaxLifetimeJitter: opt.ConnMaxLifetimeJitter,
+		ReadBufferSize:        opt.ReadBufferSize,
+		WriteBufferSize:       opt.WriteBufferSize,
+
+		PipelineReadBufferSize:  opt.PipelineReadBufferSize,
+		PipelineWriteBufferSize: opt.PipelineWriteBufferSize,
+		PipelinePoolSize:        opt.PipelinePoolSize,
+		PipelineMinIdleConns:    opt.PipelineMinIdleConns,
 
 		TLSConfig: opt.TLSConfig,
 		Limiter:   opt.Limiter,
+
+		DisableIdentity:  opt.DisableIdentity,
+		DisableIndentity: opt.DisableIndentity,
+
+		IdentitySuffix: opt.IdentitySuffix,
+		UnstableResp3:  opt.UnstableResp3,
 	}
 }
 
@@ -154,16 +291,24 @@ func (opt *RingOptions) clientOptions() *Options {
 
 type ringShard struct {
 	Client *Client
-	down   int32
+	down   atomic.Int32
+	addr   string
 }
 
-func newRingShard(opt *RingOptions, name, addr string) *ringShard {
+func newRingShard(opt *RingOptions, addr string) *ringShard {
 	clopt := opt.clientOptions()
 	clopt.Addr = addr
 
-	return &ringShard{
-		Client: opt.NewClient(name, clopt),
+	shard := &ringShard{
+		Client: opt.NewClient(clopt),
+		addr:   addr,
 	}
+	// Share the ring-wide HIMPORT fieldset registry so any shard connection
+	// serving an HIMPORT SET can lazily replay the PREPARE.
+	if opt.himport != nil {
+		shard.Client.himport = opt.himport
+	}
+	return shard
 }
 
 func (shard *ringShard) String() string {
@@ -178,7 +323,7 @@ func (shard *ringShard) String() string {
 
 func (shard *ringShard) IsDown() bool {
 	const threshold = 3
-	return atomic.LoadInt32(&shard.down) >= threshold
+	return shard.down.Load() >= threshold
 }
 
 func (shard *ringShard) IsUp() bool {
@@ -189,7 +334,7 @@ func (shard *ringShard) IsUp() bool {
 func (shard *ringShard) Vote(up bool) bool {
 	if up {
 		changed := shard.IsDown()
-		atomic.StoreInt32(&shard.down, 0)
+		shard.down.Store(0)
 		return changed
 	}
 
@@ -197,167 +342,249 @@ func (shard *ringShard) Vote(up bool) bool {
 		return false
 	}
 
-	atomic.AddInt32(&shard.down, 1)
+	shard.down.Add(1)
 	return shard.IsDown()
 }
 
 //------------------------------------------------------------------------------
 
-type ringShards struct {
+type ringSharding struct {
 	opt *RingOptions
 
-	mu       sync.RWMutex
-	hash     ConsistentHash
-	shards   map[string]*ringShard // read only
-	list     []*ringShard          // read only
-	numShard int
-	closed   bool
+	mu        sync.RWMutex
+	shards    *ringShards
+	closed    bool
+	hash      ConsistentHash
+	numShard  int
+	onNewNode []func(rdb *Client)
+
+	// ensures exclusive access to SetAddrs so there is no need
+	// to hold mu for the duration of potentially long shard creation
+	setAddrsMu sync.Mutex
 }
 
-func newRingShards(opt *RingOptions) *ringShards {
-	shards := make(map[string]*ringShard, len(opt.Addrs))
-	list := make([]*ringShard, 0, len(shards))
+type ringShards struct {
+	m    map[string]*ringShard
+	list []*ringShard
+}
 
-	for name, addr := range opt.Addrs {
-		shard := newRingShard(opt, name, addr)
-		shards[name] = shard
-
-		list = append(list, shard)
-	}
-
-	c := &ringShards{
+func newRingSharding(opt *RingOptions) *ringSharding {
+	c := &ringSharding{
 		opt: opt,
-
-		shards: shards,
-		list:   list,
 	}
-	c.rebalance()
+	c.SetAddrs(opt.Addrs)
 
 	return c
 }
 
-func (c *ringShards) List() []*ringShard {
-	var list []*ringShard
-
-	c.mu.RLock()
-	if !c.closed {
-		list = c.list
-	}
-	c.mu.RUnlock()
-
-	return list
+func (c *ringSharding) OnNewNode(fn func(rdb *Client)) {
+	c.mu.Lock()
+	c.onNewNode = append(c.onNewNode, fn)
+	c.mu.Unlock()
 }
 
-func (c *ringShards) Hash(key string) string {
+// SetAddrs replaces the shards in use, such that you can increase and
+// decrease number of shards, that you use. It will reuse shards that
+// existed before and close the ones that will not be used anymore.
+func (c *ringSharding) SetAddrs(addrs map[string]string) {
+	c.setAddrsMu.Lock()
+	defer c.setAddrsMu.Unlock()
+
+	cleanup := func(shards map[string]*ringShard) {
+		for addr, shard := range shards {
+			if err := shard.Client.Close(); err != nil {
+				internal.Logger.Printf(context.Background(), "shard.Close %s failed: %s", addr, err)
+			}
+		}
+	}
+
+	c.mu.RLock()
+	if c.closed {
+		c.mu.RUnlock()
+		return
+	}
+	existing := c.shards
+	onNewNode := c.onNewNode
+	c.mu.RUnlock()
+
+	shards, created, unused := c.newRingShards(addrs, existing, onNewNode)
+
+	c.mu.Lock()
+	if c.closed {
+		cleanup(created)
+		c.mu.Unlock()
+		return
+	}
+	c.shards = shards
+	c.rebalanceLocked()
+	c.mu.Unlock()
+
+	cleanup(unused)
+}
+
+func (c *ringSharding) newRingShards(
+	addrs map[string]string, existing *ringShards, onNewNode []func(rdb *Client),
+) (shards *ringShards, created, unused map[string]*ringShard) {
+	shards = &ringShards{m: make(map[string]*ringShard, len(addrs))}
+	created = make(map[string]*ringShard) // indexed by addr
+	unused = make(map[string]*ringShard)  // indexed by addr
+
+	if existing != nil {
+		for _, shard := range existing.list {
+			unused[shard.addr] = shard
+		}
+	}
+
+	for name, addr := range addrs {
+		if shard, ok := unused[addr]; ok {
+			shards.m[name] = shard
+			delete(unused, addr)
+		} else {
+			shard := newRingShard(c.opt, addr)
+			shards.m[name] = shard
+			created[addr] = shard
+
+			for _, fn := range onNewNode {
+				fn(shard.Client)
+			}
+		}
+	}
+
+	for _, shard := range shards.m {
+		shards.list = append(shards.list, shard)
+	}
+
+	return
+}
+
+// Warning: External exposure of `c.shards.list` may cause data races.
+// So keep internal or implement deep copy if exposed.
+func (c *ringSharding) List() []*ringShard {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.closed {
+		return nil
+	}
+	return c.shards.list
+}
+
+func (c *ringSharding) Hash(key string) string {
 	key = hashtag.Key(key)
 
 	var hash string
 
 	c.mu.RLock()
+	defer c.mu.RUnlock()
+
 	if c.numShard > 0 {
 		hash = c.hash.Get(key)
 	}
-	c.mu.RUnlock()
 
 	return hash
 }
 
-func (c *ringShards) GetByKey(key string) (*ringShard, error) {
+func (c *ringSharding) GetByKey(key string) (*ringShard, error) {
 	key = hashtag.Key(key)
 
 	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	if c.closed {
-		c.mu.RUnlock()
 		return nil, pool.ErrClosed
 	}
 
 	if c.numShard == 0 {
-		c.mu.RUnlock()
 		return nil, errRingShardsDown
 	}
 
-	hash := c.hash.Get(key)
-	if hash == "" {
-		c.mu.RUnlock()
+	shardName := c.hash.Get(key)
+	if shardName == "" {
 		return nil, errRingShardsDown
 	}
-
-	shard := c.shards[hash]
-	c.mu.RUnlock()
-
-	return shard, nil
+	return c.shards.m[shardName], nil
 }
 
-func (c *ringShards) GetByName(shardName string) (*ringShard, error) {
+func (c *ringSharding) GetByName(shardName string) (*ringShard, error) {
 	if shardName == "" {
 		return c.Random()
 	}
 
 	c.mu.RLock()
-	shard := c.shards[shardName]
-	c.mu.RUnlock()
+	defer c.mu.RUnlock()
+
+	shard, ok := c.shards.m[shardName]
+	if !ok {
+		return nil, errors.New("redis: the shard is not in the ring")
+	}
+
 	return shard, nil
 }
 
-func (c *ringShards) Random() (*ringShard, error) {
+func (c *ringSharding) Random() (*ringShard, error) {
 	return c.GetByKey(strconv.Itoa(rand.Int()))
 }
 
-// heartbeat monitors state of each shard in the ring.
-func (c *ringShards) Heartbeat(frequency time.Duration) {
+// Heartbeat monitors state of each shard in the ring.
+func (c *ringSharding) Heartbeat(ctx context.Context, frequency time.Duration) {
 	ticker := time.NewTicker(frequency)
 	defer ticker.Stop()
 
-	ctx := context.Background()
-	for range ticker.C {
-		var rebalance bool
+	for {
+		select {
+		case <-ticker.C:
+			var rebalance bool
 
-		for _, shard := range c.List() {
-			err := shard.Client.Ping(ctx).Err()
-			isUp := err == nil || err == pool.ErrPoolTimeout
-			if shard.Vote(isUp) {
-				internal.Logger.Printf(context.Background(), "ring shard state changed: %s", shard)
-				rebalance = true
+			// note: `c.List()` return a shadow copy of `[]*ringShard`.
+			for _, shard := range c.List() {
+				isUp := c.opt.HeartbeatFn(ctx, shard.Client)
+				if shard.Vote(isUp) {
+					internal.Logger.Printf(ctx, "ring shard state changed: %s", shard)
+					rebalance = true
+				}
 			}
-		}
 
-		if rebalance {
-			c.rebalance()
+			if rebalance {
+				c.mu.Lock()
+				c.rebalanceLocked()
+				c.mu.Unlock()
+			}
+		case <-ctx.Done():
+			return
 		}
 	}
 }
 
-// rebalance removes dead shards from the Ring.
-func (c *ringShards) rebalance() {
-	c.mu.RLock()
-	shards := c.shards
-	c.mu.RUnlock()
+// rebalanceLocked removes dead shards from the Ring.
+// Requires c.mu locked.
+func (c *ringSharding) rebalanceLocked() {
+	if c.closed {
+		return
+	}
+	if c.shards == nil {
+		return
+	}
 
-	liveShards := make([]string, 0, len(shards))
+	liveShards := make([]string, 0, len(c.shards.m))
 
-	for name, shard := range shards {
+	for name, shard := range c.shards.m {
 		if shard.IsUp() {
 			liveShards = append(liveShards, name)
 		}
 	}
 
-	hash := c.opt.NewConsistentHash(liveShards)
-
-	c.mu.Lock()
-	c.hash = hash
+	c.hash = c.opt.NewConsistentHash(liveShards)
 	c.numShard = len(liveShards)
-	c.mu.Unlock()
 }
 
-func (c *ringShards) Len() int {
+func (c *ringSharding) Len() int {
 	c.mu.RLock()
-	l := c.numShard
-	c.mu.RUnlock()
-	return l
+	defer c.mu.RUnlock()
+
+	return c.numShard
 }
 
-func (c *ringShards) Close() error {
+func (c *ringSharding) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -367,25 +594,21 @@ func (c *ringShards) Close() error {
 	c.closed = true
 
 	var firstErr error
-	for _, shard := range c.shards {
+
+	for _, shard := range c.shards.list {
 		if err := shard.Client.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
+
 	c.hash = nil
 	c.shards = nil
-	c.list = nil
+	c.numShard = 0
 
 	return firstErr
 }
 
 //------------------------------------------------------------------------------
-
-type ring struct {
-	opt           *RingOptions
-	shards        *ringShards
-	cmdsInfoCache *cmdsInfoCache //nolint:structcheck
-}
 
 // Ring is a Redis client that uses consistent hashing to distribute
 // keys across multiple Redis servers (shards). It's safe for
@@ -402,58 +625,74 @@ type ring struct {
 // and can tolerate losing data when one of the servers dies.
 // Otherwise you should use Redis Cluster.
 type Ring struct {
-	*ring
 	cmdable
-	hooks
-	ctx context.Context
+	hooksMixin
+
+	opt               *RingOptions
+	rec               otel.Recorder // see clientRecorder; shard clients carry their own
+	sharding          *ringSharding
+	cmdsInfoCache     *cmdsInfoCache
+	heartbeatCancelFn context.CancelFunc
 }
 
+// NewRing returns a Redis Ring client to the Redis Server specified by RingOptions.
+// Passing nil RingOptions will cause a panic.
 func NewRing(opt *RingOptions) *Ring {
+	if opt == nil {
+		panic("redis: NewRing nil options")
+	}
+	// Shallow-copy the options: the ring-wide HIMPORT registry is carried
+	// through them to shard construction, and reusing one caller-owned
+	// RingOptions across several rings must not make the rings share (or
+	// clobber each other's) registry.
+	customFactory := opt.NewClient != nil
+	optCopy := *opt
+	opt = &optCopy
 	opt.init()
+	// The registry must exist before the first shard is created; shards
+	// adopt it in newRingShard.
+	opt.himport = newHImportRegistry()
+
+	hbCtx, hbCancel := context.WithCancel(context.Background())
 
 	ring := Ring{
-		ring: &ring{
-			opt:    opt,
-			shards: newRingShards(opt),
-		},
-		ctx: context.Background(),
+		opt:               opt,
+		rec:               scopedRecorder(opt.OTelRecorder),
+		sharding:          newRingSharding(opt),
+		heartbeatCancelFn: hbCancel,
 	}
 
 	ring.cmdsInfoCache = newCmdsInfoCache(ring.cmdsInfo)
 	ring.cmdable = ring.Process
+	ring.captureCacheIntent = customFactory
 
-	go ring.shards.Heartbeat(opt.HeartbeatFrequency)
+	ring.initHooks(hooks{
+		process: ring.process,
+		pipeline: func(ctx context.Context, cmds []Cmder) error {
+			return ring.generalProcessPipeline(ctx, cmds, false)
+		},
+		txPipeline: func(ctx context.Context, cmds []Cmder) error {
+			return ring.generalProcessPipeline(ctx, cmds, true)
+		},
+	})
+
+	go ring.sharding.Heartbeat(hbCtx, opt.HeartbeatFrequency)
 
 	return &ring
 }
 
-func (c *Ring) Context() context.Context {
-	return c.ctx
-}
-
-func (c *Ring) WithContext(ctx context.Context) *Ring {
-	if ctx == nil {
-		panic("nil context")
-	}
-	clone := *c
-	clone.cmdable = clone.Process
-	clone.hooks.lock()
-	clone.ctx = ctx
-	return &clone
-}
-
-// Do creates a Cmd from the args and processes the cmd.
-func (c *Ring) Do(ctx context.Context, args ...interface{}) *Cmd {
-	cmd := NewCmd(ctx, args...)
-	_ = c.Process(ctx, cmd)
-	return cmd
+func (c *Ring) SetAddrs(addrs map[string]string) {
+	c.sharding.SetAddrs(addrs)
 }
 
 func (c *Ring) Process(ctx context.Context, cmd Cmder) error {
-	return c.hooks.process(ctx, cmd, c.process)
+	err := c.processHook(ctx, cmd)
+	cmd.SetErr(err)
+	return err
 }
 
-// Options returns read-only Options that were used to create the client.
+// Options returns read-only *RingOptions that were used to create the client.
+// Any alteration of the returned *RingOptions may result in undefined behaviour.
 func (c *Ring) Options() *RingOptions {
 	return c.opt
 }
@@ -464,50 +703,121 @@ func (c *Ring) retryBackoff(attempt int) time.Duration {
 
 // PoolStats returns accumulated connection pool stats.
 func (c *Ring) PoolStats() *PoolStats {
-	shards := c.shards.List()
+	// note: `c.List()` return a shadow copy of `[]*ringShard`.
+	shards := c.sharding.List()
 	var acc PoolStats
+	var pipe pool.Stats
+	havePipe := false
 	for _, shard := range shards {
 		s := shard.Client.connPool.Stats()
 		acc.Hits += s.Hits
 		acc.Misses += s.Misses
 		acc.Timeouts += s.Timeouts
+		acc.WaitCount += s.WaitCount
+		acc.WaitDurationNs += s.WaitDurationNs
 		acc.TotalConns += s.TotalConns
 		acc.IdleConns += s.IdleConns
+		acc.StaleConns += s.StaleConns
+
+		// Each shard now creates the dedicated pipeline pool by default; fold its
+		// stats into acc.PipelineStats so ring monitoring reflects it too.
+		if pp := shard.Client.getPipelinePool(); pp != nil {
+			ps := pp.Stats()
+			pipe.Hits += ps.Hits
+			pipe.Misses += ps.Misses
+			pipe.Timeouts += ps.Timeouts
+			pipe.WaitCount += ps.WaitCount
+			pipe.WaitDurationNs += ps.WaitDurationNs
+			pipe.TotalConns += ps.TotalConns
+			pipe.IdleConns += ps.IdleConns
+			pipe.StaleConns += ps.StaleConns
+			havePipe = true
+		}
+	}
+	if havePipe {
+		acc.PipelineStats = &pipe
 	}
 	return &acc
 }
 
 // Len returns the current number of shards in the ring.
 func (c *Ring) Len() int {
-	return c.shards.Len()
+	return c.sharding.Len()
+}
+
+// failedPubSub returns a PubSub that surfaces err on every operation instead of
+// panicking at construction (issue #3761).
+func (c *Ring) failedPubSub(err error) *PubSub {
+	if err == nil {
+		err = fmt.Errorf("redis: pubsub failed")
+	}
+	internal.Logger.Printf(context.Background(), "redis: ring pubsub creation failed: %s", err)
+	pubsub := &PubSub{
+		opt:       c.opt.clientOptions(),
+		rec:       c.rec,
+		stickyErr: err,
+	}
+	pubsub.init()
+	return pubsub
 }
 
 // Subscribe subscribes the client to the specified channels.
+// If channels is empty or shard lookup fails (e.g. empty ring), it returns
+// a PubSub with a sticky error rather than panicking.
 func (c *Ring) Subscribe(ctx context.Context, channels ...string) *PubSub {
 	if len(channels) == 0 {
-		panic("at least one channel is required")
+		return c.failedPubSub(fmt.Errorf("redis: at least one channel is required"))
 	}
 
-	shard, err := c.shards.GetByKey(channels[0])
+	shard, err := c.sharding.GetByKey(channels[0])
 	if err != nil {
-		// TODO: return PubSub with sticky error
-		panic(err)
+		return c.failedPubSub(err)
 	}
 	return shard.Client.Subscribe(ctx, channels...)
 }
 
 // PSubscribe subscribes the client to the given patterns.
+// If channels is empty or shard lookup fails (e.g. empty ring), it returns
+// a PubSub with a sticky error rather than panicking.
 func (c *Ring) PSubscribe(ctx context.Context, channels ...string) *PubSub {
 	if len(channels) == 0 {
-		panic("at least one channel is required")
+		return c.failedPubSub(fmt.Errorf("redis: at least one channel is required"))
 	}
 
-	shard, err := c.shards.GetByKey(channels[0])
+	shard, err := c.sharding.GetByKey(channels[0])
 	if err != nil {
-		// TODO: return PubSub with sticky error
-		panic(err)
+		return c.failedPubSub(err)
 	}
 	return shard.Client.PSubscribe(ctx, channels...)
+}
+
+// SSubscribe Subscribes the client to the specified shard channels.
+// If channels is empty or shard lookup fails (e.g. empty ring), it returns
+// a PubSub with a sticky error rather than panicking.
+func (c *Ring) SSubscribe(ctx context.Context, channels ...string) *PubSub {
+	if len(channels) == 0 {
+		return c.failedPubSub(fmt.Errorf("redis: at least one channel is required"))
+	}
+	shard, err := c.sharding.GetByKey(channels[0])
+	if err != nil {
+		return c.failedPubSub(err)
+	}
+	return shard.Client.SSubscribe(ctx, channels...)
+}
+
+// Publish posts the message to the channel
+func (c *Ring) Publish(ctx context.Context, channel string, message interface{}) *IntCmd {
+	shard, err := c.sharding.GetByKey(channel)
+	if err != nil {
+		cmd := NewIntCmd(ctx, "publish", channel, message)
+		cmd.SetErr(err)
+		return cmd
+	}
+	return shard.Client.Publish(ctx, channel, message)
+}
+
+func (c *Ring) OnNewNode(fn func(rdb *Client)) {
+	c.sharding.OnNewNode(fn)
 }
 
 // ForEachShard concurrently calls the fn on each live shard in the ring.
@@ -516,7 +826,8 @@ func (c *Ring) ForEachShard(
 	ctx context.Context,
 	fn func(ctx context.Context, client *Client) error,
 ) error {
-	shards := c.shards.List()
+	// note: `c.List()` return a shadow copy of `[]*ringShard`.
+	shards := c.sharding.List()
 	var wg sync.WaitGroup
 	errCh := make(chan error, 1)
 	for _, shard := range shards {
@@ -547,7 +858,8 @@ func (c *Ring) ForEachShard(
 }
 
 func (c *Ring) cmdsInfo(ctx context.Context) (map[string]*CommandInfo, error) {
-	shards := c.shards.List()
+	// note: `c.List()` return a shadow copy of `[]*ringShard`.
+	shards := c.sharding.List()
 	var firstErr error
 	for _, shard := range shards {
 		cmdsInfo, err := shard.Client.Command(ctx).Result()
@@ -564,26 +876,19 @@ func (c *Ring) cmdsInfo(ctx context.Context) (map[string]*CommandInfo, error) {
 	return nil, firstErr
 }
 
-func (c *Ring) cmdInfo(ctx context.Context, name string) *CommandInfo {
-	cmdsInfo, err := c.cmdsInfoCache.Get(ctx)
-	if err != nil {
-		return nil
+func (c *Ring) cmdShard(cmd Cmder) (*ringShard, error) {
+	// TODO: populate cmdsInfoCache lazily (via cmdsInfoCache.Get) so that
+	// the warm-cache branch in cmdFirstKeyPosWithInfo is reachable for Ring,
+	// mirroring how ClusterClient.cmdInfo works. For now pass nil
+	pos := cmdFirstKeyPosWithInfo(cmd, nil)
+	if pos < 0 {
+		return nil, fmt.Errorf("redis: cannot determine the routing key for command %s", cmd.Name())
 	}
-	info := cmdsInfo[name]
-	if info == nil {
-		internal.Logger.Printf(c.Context(), "info for cmd=%s not found", name)
-	}
-	return info
-}
-
-func (c *Ring) cmdShard(ctx context.Context, cmd Cmder) (*ringShard, error) {
-	cmdInfo := c.cmdInfo(ctx, cmd.Name())
-	pos := cmdFirstKeyPos(cmd, cmdInfo)
 	if pos == 0 {
-		return c.shards.Random()
+		return c.sharding.Random()
 	}
 	firstKey := cmd.stringArg(pos)
-	return c.shards.GetByKey(firstKey)
+	return c.sharding.GetByKey(firstKey)
 }
 
 func (c *Ring) process(ctx context.Context, cmd Cmder) error {
@@ -595,13 +900,13 @@ func (c *Ring) process(ctx context.Context, cmd Cmder) error {
 			}
 		}
 
-		shard, err := c.cmdShard(ctx, cmd)
+		shard, err := c.cmdShard(cmd)
 		if err != nil {
 			return err
 		}
 
 		lastErr = shard.Client.Process(ctx, cmd)
-		if lastErr == nil || !shouldRetry(lastErr, cmd.readTimeout() == nil) {
+		if lastErr == nil || !shouldRetry(lastErr, cmd.readTimeout() == nil) || cmd.NoRetry() {
 			return lastErr
 		}
 	}
@@ -614,17 +919,38 @@ func (c *Ring) Pipelined(ctx context.Context, fn func(Pipeliner) error) ([]Cmder
 
 func (c *Ring) Pipeline() Pipeliner {
 	pipe := Pipeline{
-		ctx:  c.ctx,
-		exec: c.processPipeline,
+		exec: pipelineExecer(c.processPipelineHook),
 	}
 	pipe.init()
 	return &pipe
 }
 
-func (c *Ring) processPipeline(ctx context.Context, cmds []Cmder) error {
-	return c.hooks.processPipeline(ctx, cmds, func(ctx context.Context, cmds []Cmder) error {
-		return c.generalProcessPipeline(ctx, cmds, false)
-	})
+// ErrRingAutoPipelineUnsupported is returned by Ring's AutoPipeline /
+// AsyncAutoPipeline (and their WithOptions forms); check for it with
+// errors.Is. Autopipelining is not implemented for Ring; use the per-shard
+// clients or a ClusterClient. Ring is part of the UniversalClient
+// interface, so these methods exist to satisfy it and fail explicitly rather
+// than being silently absent.
+var ErrRingAutoPipelineUnsupported = errors.New("redis: AutoPipeline is not supported by Ring")
+
+// AutoPipeline is not supported by Ring; it returns ErrRingAutoPipelineUnsupported.
+func (c *Ring) AutoPipeline() (*AutoPipeliner, error) {
+	return c.AutoPipelineWithOptions(nil)
+}
+
+// AutoPipelineWithOptions is not supported by Ring; it returns ErrRingAutoPipelineUnsupported.
+func (c *Ring) AutoPipelineWithOptions(config *AutoPipelineOptions) (*AutoPipeliner, error) {
+	return nil, ErrRingAutoPipelineUnsupported
+}
+
+// AsyncAutoPipeline is not supported by Ring; it returns ErrRingAutoPipelineUnsupported.
+func (c *Ring) AsyncAutoPipeline() (*AutoPipeliner, error) {
+	return c.AsyncAutoPipelineWithOptions(nil)
+}
+
+// AsyncAutoPipelineWithOptions is not supported by Ring; it returns ErrRingAutoPipelineUnsupported.
+func (c *Ring) AsyncAutoPipelineWithOptions(config *AutoPipelineOptions) (*AutoPipeliner, error) {
+	return nil, ErrRingAutoPipelineUnsupported
 }
 
 func (c *Ring) TxPipelined(ctx context.Context, fn func(Pipeliner) error) ([]Cmder, error) {
@@ -633,60 +959,77 @@ func (c *Ring) TxPipelined(ctx context.Context, fn func(Pipeliner) error) ([]Cmd
 
 func (c *Ring) TxPipeline() Pipeliner {
 	pipe := Pipeline{
-		ctx:  c.ctx,
-		exec: c.processTxPipeline,
+		exec: func(ctx context.Context, cmds []Cmder) error {
+			cmds = wrapMultiExec(ctx, cmds)
+			return c.processTxPipelineHook(ctx, cmds)
+		},
 	}
 	pipe.init()
 	return &pipe
 }
 
-func (c *Ring) processTxPipeline(ctx context.Context, cmds []Cmder) error {
-	return c.hooks.processPipeline(ctx, cmds, func(ctx context.Context, cmds []Cmder) error {
-		return c.generalProcessPipeline(ctx, cmds, true)
-	})
-}
-
 func (c *Ring) generalProcessPipeline(
 	ctx context.Context, cmds []Cmder, tx bool,
 ) error {
+	if tx {
+		// Trim multi .. exec.
+		cmds = cmds[1 : len(cmds)-1]
+	}
+
 	cmdsMap := make(map[string][]Cmder)
+
 	for _, cmd := range cmds {
-		cmdInfo := c.cmdInfo(ctx, cmd.Name())
-		hash := cmd.stringArg(cmdFirstKeyPos(cmd, cmdInfo))
+		pos := cmdFirstKeyPosWithInfo(cmd, nil)
+		if pos < 0 {
+			err := fmt.Errorf("redis: cannot determine the routing key for command %s", cmd.Name())
+			cmd.SetErr(err)
+			if tx {
+				setCmdsErr(cmds, err)
+				return err
+			}
+			continue
+		}
+		hash := cmd.stringArg(pos)
 		if hash != "" {
-			hash = c.shards.Hash(hash)
+			hash = c.sharding.Hash(hash)
 		}
 		cmdsMap[hash] = append(cmdsMap[hash], cmd)
 	}
 
 	var wg sync.WaitGroup
+	errs := make(chan error, len(cmdsMap))
+
 	for hash, cmds := range cmdsMap {
 		wg.Add(1)
 		go func(hash string, cmds []Cmder) {
 			defer wg.Done()
 
-			_ = c.processShardPipeline(ctx, hash, cmds, tx)
+			// TODO: retry?
+			shard, err := c.sharding.GetByName(hash)
+			if err != nil {
+				setCmdsErr(cmds, err)
+				return
+			}
+
+			hook := shard.Client.processPipelineHook
+			if tx {
+				cmds = wrapMultiExec(ctx, cmds)
+				hook = shard.Client.processTxPipelineHook
+			}
+
+			if err = hook(ctx, cmds); err != nil {
+				errs <- err
+			}
 		}(hash, cmds)
 	}
 
 	wg.Wait()
-	return cmdsFirstErr(cmds)
-}
+	close(errs)
 
-func (c *Ring) processShardPipeline(
-	ctx context.Context, hash string, cmds []Cmder, tx bool,
-) error {
-	// TODO: retry?
-	shard, err := c.shards.GetByName(hash)
-	if err != nil {
-		setCmdsErr(cmds, err)
+	if err := <-errs; err != nil {
 		return err
 	}
-
-	if tx {
-		return shard.Client.processTxPipeline(ctx, cmds)
-	}
-	return shard.Client.processPipeline(ctx, cmds)
+	return cmdsFirstErr(cmds)
 }
 
 func (c *Ring) Watch(ctx context.Context, fn func(*Tx) error, keys ...string) error {
@@ -695,9 +1038,10 @@ func (c *Ring) Watch(ctx context.Context, fn func(*Tx) error, keys ...string) er
 	}
 
 	var shards []*ringShard
+
 	for _, key := range keys {
 		if key != "" {
-			shard, err := c.shards.GetByKey(hashtag.Key(key))
+			shard, err := c.sharding.GetByKey(key)
 			if err != nil {
 				return err
 			}
@@ -727,5 +1071,30 @@ func (c *Ring) Watch(ctx context.Context, fn func(*Tx) error, keys ...string) er
 // It is rare to Close a Ring, as the Ring is meant to be long-lived
 // and shared between many goroutines.
 func (c *Ring) Close() error {
-	return c.shards.Close()
+	c.heartbeatCancelFn()
+
+	return c.sharding.Close()
+}
+
+// GetShardClients returns a list of all shard clients in the ring.
+// This can be used to create dedicated connections (e.g., PubSub) for each shard.
+func (c *Ring) GetShardClients() []*Client {
+	shards := c.sharding.List()
+	clients := make([]*Client, 0, len(shards))
+	for _, shard := range shards {
+		if shard.IsUp() {
+			clients = append(clients, shard.Client)
+		}
+	}
+	return clients
+}
+
+// GetShardClientForKey returns the shard client that would handle the given key.
+// This can be used to determine which shard a particular key/channel would be routed to.
+func (c *Ring) GetShardClientForKey(key string) (*Client, error) {
+	shard, err := c.sharding.GetByKey(key)
+	if err != nil {
+		return nil, err
+	}
+	return shard.Client, nil
 }

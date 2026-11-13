@@ -2,18 +2,16 @@ package redis
 
 import (
 	"context"
-	"sync"
-
-	"github.com/go-redis/redis/v8/internal/pool"
+	"errors"
 )
 
 type pipelineExecer func(context.Context, []Cmder) error
 
-// Pipeliner is an mechanism to realise Redis Pipeline technique.
+// Pipeliner is a mechanism to realise Redis Pipeline technique.
 //
 // Pipelining is a technique to extremely speed up processing by packing
 // operations to batches, send them at once to Redis and read a replies in a
-// singe step.
+// single step.
 // See https://redis.io/topics/pipelining
 //
 // Pay attention, that Pipeline is not a transaction, so you can get unexpected
@@ -24,28 +22,41 @@ type pipelineExecer func(context.Context, []Cmder) error
 // depends of your batch size and/or use TxPipeline.
 type Pipeliner interface {
 	StatefulCmdable
+
+	// Len obtains the number of commands in the pipeline that have not yet been executed.
+	Len() int
+
+	// Do is an API for executing any command.
+	// If a certain Redis command is not yet supported, you can use Do to execute it.
 	Do(ctx context.Context, args ...interface{}) *Cmd
+
+	// Process queues the cmd for later execution.
 	Process(ctx context.Context, cmd Cmder) error
-	Close() error
-	Discard() error
+
+	// BatchProcess adds multiple commands to be executed into the pipeline buffer.
+	BatchProcess(ctx context.Context, cmd ...Cmder) error
+
+	// Discard discards all commands in the pipeline buffer that have not yet been executed.
+	Discard()
+
+	// Exec sends all the commands buffered in the pipeline to the redis server.
 	Exec(ctx context.Context) ([]Cmder, error)
+
+	// Cmds returns the list of queued commands.
+	Cmds() []Cmder
 }
 
 var _ Pipeliner = (*Pipeline)(nil)
 
 // Pipeline implements pipelining as described in
-// http://redis.io/topics/pipelining. It's safe for concurrent use
-// by multiple goroutines.
+// https://redis.io/docs/latest/develop/using-commands/pipelining.
+// Please note: it is not safe for concurrent use by multiple goroutines.
 type Pipeline struct {
 	cmdable
 	statefulCmdable
 
-	ctx  context.Context
 	exec pipelineExecer
-
-	mu     sync.Mutex
-	cmds   []Cmder
-	closed bool
+	cmds []Cmder
 }
 
 func (c *Pipeline) init() {
@@ -53,43 +64,45 @@ func (c *Pipeline) init() {
 	c.statefulCmdable = c.Process
 }
 
+// Len returns the number of queued commands.
+func (c *Pipeline) Len() int {
+	return len(c.cmds)
+}
+
+// Do queues the custom command for later execution.
 func (c *Pipeline) Do(ctx context.Context, args ...interface{}) *Cmd {
 	cmd := NewCmd(ctx, args...)
+	if len(args) == 0 {
+		cmd.SetErr(errors.New("redis: please enter the command to be executed"))
+		return cmd
+	}
 	_ = c.Process(ctx, cmd)
 	return cmd
 }
 
 // Process queues the cmd for later execution.
 func (c *Pipeline) Process(ctx context.Context, cmd Cmder) error {
-	c.mu.Lock()
-	c.cmds = append(c.cmds, cmd)
-	c.mu.Unlock()
-	return nil
+	return c.BatchProcess(ctx, cmd)
 }
 
-// Close closes the pipeline, releasing any open resources.
-func (c *Pipeline) Close() error {
-	c.mu.Lock()
-	_ = c.discard()
-	c.closed = true
-	c.mu.Unlock()
+// BatchProcess queues multiple cmds for later execution.
+func (c *Pipeline) BatchProcess(ctx context.Context, cmd ...Cmder) error {
+	// Public pipelines are uncached. Consume a clone's earlier cache intent
+	// at submission, including when the caller later discards the pipeline.
+	// Internal pipelines (for example ASKING + a redirected command) retain
+	// the state owned by their active invocation.
+	for _, command := range cmd {
+		if state := command.cacheState(); state.depth == 0 {
+			resetCSCCommand(command)
+		}
+	}
+	c.cmds = append(c.cmds, cmd...)
 	return nil
 }
 
 // Discard resets the pipeline and discards queued commands.
-func (c *Pipeline) Discard() error {
-	c.mu.Lock()
-	err := c.discard()
-	c.mu.Unlock()
-	return err
-}
-
-func (c *Pipeline) discard() error {
-	if c.closed {
-		return pool.ErrClosed
-	}
+func (c *Pipeline) Discard() {
 	c.cmds = c.cmds[:0]
-	return nil
 }
 
 // Exec executes all previously queued commands using one
@@ -98,13 +111,6 @@ func (c *Pipeline) discard() error {
 // Exec always returns list of commands and error of the first failed
 // command if any.
 func (c *Pipeline) Exec(ctx context.Context) ([]Cmder, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.closed {
-		return nil, pool.ErrClosed
-	}
-
 	if len(c.cmds) == 0 {
 		return nil, nil
 	}
@@ -112,16 +118,16 @@ func (c *Pipeline) Exec(ctx context.Context) ([]Cmder, error) {
 	cmds := c.cmds
 	c.cmds = nil
 
-	return cmds, c.exec(ctx, cmds)
+	// Public pipeline commands are uncached. Do not pass an Exec mark to
+	// internal connection initialization or Cluster topology queries.
+	return cmds, c.exec(cscUnmarkedContext(ctx), cmds)
 }
 
 func (c *Pipeline) Pipelined(ctx context.Context, fn func(Pipeliner) error) ([]Cmder, error) {
 	if err := fn(c); err != nil {
 		return nil, err
 	}
-	cmds, err := c.Exec(ctx)
-	_ = c.Close()
-	return cmds, err
+	return c.Exec(ctx)
 }
 
 func (c *Pipeline) Pipeline() Pipeliner {
@@ -134,4 +140,8 @@ func (c *Pipeline) TxPipelined(ctx context.Context, fn func(Pipeliner) error) ([
 
 func (c *Pipeline) TxPipeline() Pipeliner {
 	return c
+}
+
+func (c *Pipeline) Cmds() []Cmder {
+	return c.cmds
 }

@@ -3,14 +3,17 @@ package proto
 import (
 	"encoding"
 	"fmt"
+	"net"
 	"reflect"
 	"time"
 
-	"github.com/go-redis/redis/v8/internal/util"
+	"github.com/redis/go-redis/v9/internal/util"
 )
 
 // Scan parses bytes `b` to `v` with appropriate type.
-func Scan(b []byte, v interface{}) error {
+//
+//nolint:gocyclo
+func Scan(b []byte, v any) error {
 	switch v := v.(type) {
 	case nil:
 		return fmt.Errorf("redis: Scan(nil)")
@@ -18,7 +21,9 @@ func Scan(b []byte, v interface{}) error {
 		*v = util.BytesToString(b)
 		return nil
 	case *[]byte:
-		*v = b
+		dest := make([]byte, len(b))
+		copy(dest, b)
+		*v = dest
 		return nil
 	case *int:
 		var err error
@@ -53,7 +58,7 @@ func Scan(b []byte, v interface{}) error {
 		*v = n
 		return nil
 	case *uint:
-		n, err := util.ParseUint(b, 10, 64)
+		n, err := util.ParseUint(b, 10, 0)
 		if err != nil {
 			return err
 		}
@@ -105,20 +110,34 @@ func Scan(b []byte, v interface{}) error {
 		var err error
 		*v, err = time.Parse(time.RFC3339Nano, util.BytesToString(b))
 		return err
+	case *time.Duration:
+		n, err := util.ParseInt(b, 10, 64)
+		if err != nil {
+			return err
+		}
+		*v = time.Duration(n)
+		return nil
 	case encoding.BinaryUnmarshaler:
-		return v.UnmarshalBinary(b)
+		dest := make([]byte, len(b))
+		copy(dest, b)
+		return v.UnmarshalBinary(dest)
+	case *net.IP:
+		dest := make(net.IP, len(b))
+		copy(dest, b)
+		*v = dest
+		return nil
 	default:
 		return fmt.Errorf(
 			"redis: can't unmarshal %T (consider implementing BinaryUnmarshaler)", v)
 	}
 }
 
-func ScanSlice(data []string, slice interface{}) error {
+func ScanSlice(data []string, slice any) error {
 	v := reflect.ValueOf(slice)
 	if !v.IsValid() {
 		return fmt.Errorf("redis: ScanSlice(nil)")
 	}
-	if v.Kind() != reflect.Ptr {
+	if v.Kind() != reflect.Pointer {
 		return fmt.Errorf("redis: ScanSlice(non-pointer %T)", slice)
 	}
 	v = v.Elem()
@@ -129,7 +148,7 @@ func ScanSlice(data []string, slice interface{}) error {
 	next := makeSliceNextElemFunc(v)
 	for i, s := range data {
 		elem := next()
-		if err := Scan([]byte(s), elem.Addr().Interface()); err != nil {
+		if err := Scan(util.StringToBytes(s), elem.Addr().Interface()); err != nil {
 			err = fmt.Errorf("redis: ScanSlice index=%d value=%q failed: %w", i, s, err)
 			return err
 		}
@@ -141,32 +160,25 @@ func ScanSlice(data []string, slice interface{}) error {
 func makeSliceNextElemFunc(v reflect.Value) func() reflect.Value {
 	elemType := v.Type().Elem()
 
-	if elemType.Kind() == reflect.Ptr {
+	next := func() reflect.Value {
+		if v.Len() == v.Cap() {
+			v.Grow(1)
+		}
+
+		v.SetLen(v.Len() + 1)
+		return v.Index(v.Len() - 1)
+	}
+
+	if elemType.Kind() == reflect.Pointer {
 		elemType = elemType.Elem()
 		return func() reflect.Value {
-			if v.Len() < v.Cap() {
-				v.Set(v.Slice(0, v.Len()+1))
-				elem := v.Index(v.Len() - 1)
-				if elem.IsNil() {
-					elem.Set(reflect.New(elemType))
-				}
-				return elem.Elem()
+			elem := next()
+			if elem.IsNil() {
+				elem.Set(reflect.New(elemType))
 			}
-
-			elem := reflect.New(elemType)
-			v.Set(reflect.Append(v, elem))
 			return elem.Elem()
 		}
 	}
 
-	zero := reflect.Zero(elemType)
-	return func() reflect.Value {
-		if v.Len() < v.Cap() {
-			v.Set(v.Slice(0, v.Len()+1))
-			return v.Index(v.Len() - 1)
-		}
-
-		v.Set(reflect.Append(v, zero))
-		return v.Index(v.Len() - 1)
-	}
+	return next
 }

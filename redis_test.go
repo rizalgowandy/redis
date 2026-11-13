@@ -4,28 +4,34 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/go-redis/redis/v8"
-
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	. "github.com/bsm/ginkgo/v2"
+	. "github.com/bsm/gomega"
+	"github.com/redis/go-redis/v9"
+	"github.com/redis/go-redis/v9/auth"
 )
 
-type redisHookError struct {
-	redis.Hook
-}
+type redisHookError struct{}
 
 var _ redis.Hook = redisHookError{}
 
-func (redisHookError) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
-	return ctx, nil
+func (redisHookError) DialHook(hook redis.DialHook) redis.DialHook {
+	return hook
 }
 
-func (redisHookError) AfterProcess(ctx context.Context, cmd redis.Cmder) error {
-	return errors.New("hook error")
+func (redisHookError) ProcessHook(hook redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		return errors.New("hook error")
+	}
+}
+
+func (redisHookError) ProcessPipelineHook(hook redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return hook
 }
 
 func TestHookError(t *testing.T) {
@@ -59,8 +65,10 @@ var _ = Describe("Client", func() {
 		client.Close()
 	})
 
-	It("should Stringer", func() {
-		Expect(client.String()).To(Equal("Redis<:6380 db:15>"))
+	// NonRedisEnterprise: asserts the exact local address in the client's String()
+	// representation, which does not match a remote Redis Enterprise endpoint.
+	It("should Stringer", Label("NonRedisEnterprise"), func() {
+		Expect(client.String()).To(Equal(fmt.Sprintf("Redis<:%s db:0>", redisPort)))
 	})
 
 	It("supports context", func() {
@@ -71,7 +79,7 @@ var _ = Describe("Client", func() {
 		Expect(err).To(MatchError("context canceled"))
 	})
 
-	It("supports WithTimeout", func() {
+	It("supports WithTimeout", Label("NonRedisEnterprise"), func() {
 		err := client.ClientPause(ctx, time.Second).Err()
 		Expect(err).NotTo(HaveOccurred())
 
@@ -80,6 +88,34 @@ var _ = Describe("Client", func() {
 
 		err = client.Ping(ctx).Err()
 		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("should support PubSub with WithTimeout", func() {
+		// Create a new client with a custom timeout
+		newClient := client.WithTimeout(5 * time.Second)
+
+		// Subscribe to a channel using the cloned client
+		pubsub := newClient.Subscribe(ctx, "test-channel")
+		defer pubsub.Close()
+
+		// Verify that we can receive the subscription confirmation
+		_, err := pubsub.ReceiveTimeout(ctx, time.Second)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Publish a message using the original client
+		err = client.Publish(ctx, "test-channel", "test-message").Err()
+		Expect(err).NotTo(HaveOccurred())
+
+		// Receive the message
+		msg, err := pubsub.ReceiveTimeout(ctx, time.Second)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(msg).NotTo(BeNil())
+	})
+
+	It("do", func() {
+		val, err := client.Do(ctx, "ping").Result()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(val).To(Equal("PONG"))
 	})
 
 	It("should ping", func() {
@@ -92,7 +128,10 @@ var _ = Describe("Client", func() {
 		Expect(client.PoolStats()).To(BeAssignableToTypeOf(&redis.PoolStats{}))
 	})
 
-	It("should support custom dialers", func() {
+	// NonRedisEnterprise: this spec installs a plain custom net.Dialer, which replaces
+	// go-redis' TLS-aware dial path, so it cannot connect to a TLS-enabled Redis
+	// Enterprise endpoint; it exercises client dialer wiring against a local server.
+	It("should support custom dialers", Label("NonRedisEnterprise"), func() {
 		custom := redis.NewClient(&redis.Options{
 			Network: "tcp",
 			Addr:    redisAddr,
@@ -136,17 +175,6 @@ var _ = Describe("Client", func() {
 		Expect(client.Ping(ctx).Err()).NotTo(HaveOccurred())
 	})
 
-	It("should close pipeline without closing the client", func() {
-		pipeline := client.Pipeline()
-		Expect(pipeline.Close()).NotTo(HaveOccurred())
-
-		pipeline.Ping(ctx)
-		_, err := pipeline.Exec(ctx)
-		Expect(err).To(MatchError("redis: client is closed"))
-
-		Expect(client.Ping(ctx).Err()).NotTo(HaveOccurred())
-	})
-
 	It("should close pubsub when client is closed", func() {
 		pubsub := client.Subscribe(ctx)
 		Expect(client.Close()).NotTo(HaveOccurred())
@@ -157,13 +185,7 @@ var _ = Describe("Client", func() {
 		Expect(pubsub.Close()).NotTo(HaveOccurred())
 	})
 
-	It("should close pipeline when client is closed", func() {
-		pipeline := client.Pipeline()
-		Expect(client.Close()).NotTo(HaveOccurred())
-		Expect(pipeline.Close()).NotTo(HaveOccurred())
-	})
-
-	It("should select DB", func() {
+	It("should select DB", Label("NonRedisEnterprise"), func() {
 		db2 := redis.NewClient(&redis.Options{
 			Addr: redisAddr,
 			DB:   2,
@@ -182,6 +204,166 @@ var _ = Describe("Client", func() {
 		Expect(db2.Close()).NotTo(HaveOccurred())
 	})
 
+	It("should client setname", func() {
+		opt := redisOptions()
+		opt.ClientName = "hi"
+		db := redis.NewClient(opt)
+
+		defer func() {
+			Expect(db.Close()).NotTo(HaveOccurred())
+		}()
+
+		Expect(db.Ping(ctx).Err()).NotTo(HaveOccurred())
+		val, err := db.ClientList(ctx).Result()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(val).Should(ContainSubstring("name=hi"))
+	})
+
+	It("should attempt to set client name in HELLO", func() {
+		opt := redisOptions()
+		opt.ClientName = "hi"
+		db := redis.NewClient(opt)
+
+		defer func() {
+			Expect(db.Close()).NotTo(HaveOccurred())
+		}()
+
+		// Client name should be already set on any successfully initialized connection
+		name, err := db.ClientGetName(ctx).Result()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(name).Should(Equal("hi"))
+
+		// HELLO should be able to explicitly overwrite the client name
+		conn := db.Conn()
+		hello, err := conn.Hello(ctx, 3, "", "", "hi2").Result()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(hello["proto"]).Should(Equal(int64(3)))
+		name, err = conn.ClientGetName(ctx).Result()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(name).Should(Equal("hi2"))
+		err = conn.Close()
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("should not return an EphemeralConn's session state to the pool", Label("NonRedisEnterprise"), func() {
+		opt := redisOptions()
+		opt.PoolSize = 1
+		db := redis.NewClient(opt)
+
+		defer func() {
+			Expect(db.Close()).NotTo(HaveOccurred())
+		}()
+
+		conn := db.EphemeralConn()
+		Expect(conn.Select(ctx, 1).Err()).NotTo(HaveOccurred())
+		Expect(conn.Close()).NotTo(HaveOccurred())
+
+		// With a single pool slot, a connection handed back by Close would
+		// serve this command and report db=1.
+		info, err := db.ClientInfo(ctx).Result()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(info.DB).To(Equal(0))
+	})
+
+	It("should return a Conn to the pool on Close", func() {
+		opt := redisOptions()
+		opt.PoolSize = 1
+		db := redis.NewClient(opt)
+
+		defer func() {
+			Expect(db.Close()).NotTo(HaveOccurred())
+		}()
+
+		conn := db.Conn()
+		Expect(conn.Ping(ctx).Err()).NotTo(HaveOccurred())
+		Expect(conn.Close()).NotTo(HaveOccurred())
+
+		Expect(db.PoolStats().IdleConns).To(Equal(uint32(1)))
+	})
+
+	It("should client PROTO 2", func() {
+		opt := redisOptions()
+		opt.Protocol = 2
+		db := redis.NewClient(opt)
+
+		defer func() {
+			Expect(db.Close()).NotTo(HaveOccurred())
+		}()
+
+		val, err := db.Do(ctx, "HELLO").Result()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(val).Should(ContainElements("proto", int64(2)))
+	})
+
+	It("should client PROTO 3", func() {
+		opt := redisOptions()
+		db := redis.NewClient(opt)
+
+		defer func() {
+			Expect(db.Close()).NotTo(HaveOccurred())
+		}()
+
+		val, err := db.Do(ctx, "HELLO").Result()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(val).Should(HaveKeyWithValue("proto", int64(3)))
+	})
+
+	It("should initialize idle connections created by MinIdleConns", Label("NonRedisEnterprise"), func() {
+		opt := redisOptions()
+		passwrd := "asdf"
+		db0 := redis.NewClient(opt)
+		// set password
+		err := db0.Do(ctx, "CONFIG", "SET", "requirepass", passwrd).Err()
+		Expect(err).NotTo(HaveOccurred())
+		defer func() {
+			err = db0.Do(ctx, "CONFIG", "SET", "requirepass", "").Err()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(db0.Close()).NotTo(HaveOccurred())
+		}()
+		opt.MinIdleConns = 5
+		opt.Password = passwrd
+		opt.DB = 1 // Set DB to require SELECT
+
+		db := redis.NewClient(opt)
+		defer func() {
+			Expect(db.Close()).NotTo(HaveOccurred())
+		}()
+
+		// Wait for minIdle connections to be created
+		time.Sleep(100 * time.Millisecond)
+
+		// Verify that idle connections were created
+		stats := db.PoolStats()
+		Expect(stats.IdleConns).To(BeNumerically(">=", 5))
+
+		// Now use these connections - they should be properly initialized
+		// If they're not initialized, we'll get NOAUTH or WRONGDB errors
+		var wg sync.WaitGroup
+		for i := 0; i < 10; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				// Each goroutine performs multiple operations
+				for j := 0; j < 5; j++ {
+					key := fmt.Sprintf("test_key_%d_%d", id, j)
+					err := db.Set(ctx, key, "value", 0).Err()
+					Expect(err).NotTo(HaveOccurred())
+
+					val, err := db.Get(ctx, key).Result()
+					Expect(err).NotTo(HaveOccurred())
+					Expect(val).To(Equal("value"))
+
+					err = db.Del(ctx, key).Err()
+					Expect(err).NotTo(HaveOccurred())
+				}
+			}(i)
+		}
+		wg.Wait()
+
+		// Verify no errors occurred
+		Expect(db.Ping(ctx).Err()).NotTo(HaveOccurred())
+	})
+
 	It("processes custom commands", func() {
 		cmd := redis.NewCmd(ctx, "PING")
 		_ = client.Process(ctx, cmd)
@@ -196,10 +378,12 @@ var _ = Describe("Client", func() {
 	It("should retry command on network error", func() {
 		Expect(client.Close()).NotTo(HaveOccurred())
 
-		client = redis.NewClient(&redis.Options{
+		retryOpt := &redis.Options{
 			Addr:       redisAddr,
 			MaxRetries: 1,
-		})
+		}
+		applyREConnection(retryOpt)
+		client = redis.NewClient(retryOpt)
 
 		// Put bad connection in the pool.
 		cn, err := client.Pool().Get(ctx)
@@ -260,6 +444,7 @@ var _ = Describe("Client", func() {
 		cn, err = client.Pool().Get(context.Background())
 		Expect(err).NotTo(HaveOccurred())
 		Expect(cn).NotTo(BeNil())
+		Expect(cn.UsedAt().UnixNano()).To(BeNumerically(">", createdAt.UnixNano()))
 		Expect(cn.UsedAt().After(createdAt)).To(BeTrue())
 	})
 
@@ -290,19 +475,43 @@ var _ = Describe("Client", func() {
 
 	It("should set and scan time", func() {
 		tm := time.Now()
-		err := rdb.Set(ctx, "now", tm, 0).Err()
+		err := client.Set(ctx, "now", tm, 0).Err()
 		Expect(err).NotTo(HaveOccurred())
 
 		var tm2 time.Time
-		err = rdb.Get(ctx, "now").Scan(&tm2)
+		err = client.Get(ctx, "now").Scan(&tm2)
 		Expect(err).NotTo(HaveOccurred())
 
 		Expect(tm2).To(BeTemporally("==", tm))
 	})
 
+	It("should set and scan durations", func() {
+		duration := 10 * time.Minute
+		err := client.Set(ctx, "duration", duration, 0).Err()
+		Expect(err).NotTo(HaveOccurred())
+
+		var duration2 time.Duration
+		err = client.Get(ctx, "duration").Scan(&duration2)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(duration2).To(Equal(duration))
+	})
+
 	It("should Conn", func() {
-		err := rdb.Conn(ctx).Get(ctx, "this-key-does-not-exist").Err()
+		err := client.Conn().Get(ctx, "this-key-does-not-exist").Err()
 		Expect(err).To(Equal(redis.Nil))
+	})
+
+	It("should set and scan net.IP", func() {
+		ip := net.ParseIP("192.168.1.1")
+		err := client.Set(ctx, "ip", ip, 0).Err()
+		Expect(err).NotTo(HaveOccurred())
+
+		var ip2 net.IP
+		err = client.Get(ctx, "ip").Scan(&ip2)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(ip2).To(Equal(ip))
 	})
 })
 
@@ -315,6 +524,13 @@ var _ = Describe("Client timeout", func() {
 	})
 
 	testTimeout := func() {
+		It("SETINFO timeouts", func() {
+			conn := client.Conn()
+			err := conn.Ping(ctx).Err()
+			Expect(err).To(HaveOccurred())
+			Expect(err.(net.Error).Timeout()).To(BeTrue())
+		})
+
 		It("Ping timeouts", func() {
 			err := client.Ping(ctx).Err()
 			Expect(err).To(HaveOccurred())
@@ -411,7 +627,7 @@ var _ = Describe("Client OnConnect", func() {
 	})
 })
 
-var _ = Describe("Client context cancelation", func() {
+var _ = Describe("Client context cancellation", func() {
 	var opt *redis.Options
 	var client *redis.Client
 
@@ -426,12 +642,477 @@ var _ = Describe("Client context cancelation", func() {
 		Expect(client.Close()).NotTo(HaveOccurred())
 	})
 
-	It("Blocking operation cancelation", func() {
+	It("Blocking operation cancellation", func() {
 		ctx, cancel := context.WithCancel(ctx)
 		cancel()
 
 		err := client.BLPop(ctx, 1*time.Second, "test").Err()
 		Expect(err).To(HaveOccurred())
 		Expect(err).To(BeIdenticalTo(context.Canceled))
+	})
+})
+
+var _ = Describe("Conn", func() {
+	var client *redis.Client
+
+	BeforeEach(func() {
+		client = redis.NewClient(redisOptions())
+		Expect(client.FlushDB(ctx).Err()).NotTo(HaveOccurred())
+	})
+
+	AfterEach(func() {
+		err := client.Close()
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("TxPipeline", Label("NonRedisEnterprise"), func() {
+		tx := client.Conn().TxPipeline()
+		tx.SwapDB(ctx, 0, 2)
+		tx.SwapDB(ctx, 1, 0)
+		_, err := tx.Exec(ctx)
+		Expect(err).NotTo(HaveOccurred())
+	})
+})
+
+var _ = Describe("Hook", func() {
+	var client *redis.Client
+
+	BeforeEach(func() {
+		client = redis.NewClient(redisOptions())
+		Expect(client.FlushDB(ctx).Err()).NotTo(HaveOccurred())
+	})
+
+	AfterEach(func() {
+		err := client.Close()
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("fifo", func() {
+		var res []string
+		client.AddHook(&hook{
+			processHook: func(hook redis.ProcessHook) redis.ProcessHook {
+				return func(ctx context.Context, cmd redis.Cmder) error {
+					res = append(res, "hook-1-process-start")
+					err := hook(ctx, cmd)
+					res = append(res, "hook-1-process-end")
+					return err
+				}
+			},
+		})
+		client.AddHook(&hook{
+			processHook: func(hook redis.ProcessHook) redis.ProcessHook {
+				return func(ctx context.Context, cmd redis.Cmder) error {
+					res = append(res, "hook-2-process-start")
+					err := hook(ctx, cmd)
+					res = append(res, "hook-2-process-end")
+					return err
+				}
+			},
+		})
+
+		err := client.Ping(ctx).Err()
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(res).To(Equal([]string{
+			"hook-1-process-start",
+			"hook-2-process-start",
+			"hook-2-process-end",
+			"hook-1-process-end",
+		}))
+	})
+
+	It("wrapped error in a hook", func() {
+		client.AddHook(&hook{
+			processHook: func(hook redis.ProcessHook) redis.ProcessHook {
+				return func(ctx context.Context, cmd redis.Cmder) error {
+					if err := hook(ctx, cmd); err != nil {
+						return fmt.Errorf("wrapped error: %w", err)
+					}
+					return nil
+				}
+			},
+		})
+		client.ScriptFlush(ctx)
+
+		script := redis.NewScript(`return 'Script and hook'`)
+
+		cmd := script.Run(ctx, client, nil)
+		Expect(cmd.Err()).NotTo(HaveOccurred())
+		Expect(cmd.Val()).To(Equal("Script and hook"))
+	})
+})
+
+var _ = Describe("Hook with MinIdleConns", func() {
+	var client *redis.Client
+
+	BeforeEach(func() {
+		options := redisOptions()
+		options.MinIdleConns = 1
+		client = redis.NewClient(options)
+		Expect(client.FlushDB(ctx).Err()).NotTo(HaveOccurred())
+	})
+
+	AfterEach(func() {
+		err := client.Close()
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("fifo", func() {
+		var res []string
+		client.AddHook(&hook{
+			processHook: func(hook redis.ProcessHook) redis.ProcessHook {
+				return func(ctx context.Context, cmd redis.Cmder) error {
+					res = append(res, "hook-1-process-start")
+					err := hook(ctx, cmd)
+					res = append(res, "hook-1-process-end")
+					return err
+				}
+			},
+		})
+		client.AddHook(&hook{
+			processHook: func(hook redis.ProcessHook) redis.ProcessHook {
+				return func(ctx context.Context, cmd redis.Cmder) error {
+					res = append(res, "hook-2-process-start")
+					err := hook(ctx, cmd)
+					res = append(res, "hook-2-process-end")
+					return err
+				}
+			},
+		})
+
+		err := client.Ping(ctx).Err()
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(res).To(Equal([]string{
+			"hook-1-process-start",
+			"hook-2-process-start",
+			"hook-2-process-end",
+			"hook-1-process-end",
+		}))
+	})
+})
+
+var _ = Describe("Dialer connection timeouts", func() {
+	var client *redis.Client
+
+	const dialSimulatedDelay = 1 * time.Second
+
+	BeforeEach(func() {
+		options := redisOptions()
+		options.Dialer = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// Simulated slow dialer.
+			// Note that the following sleep is deliberately not context-aware.
+			time.Sleep(dialSimulatedDelay)
+			return net.Dial("tcp", options.Addr)
+		}
+		options.MinIdleConns = 1
+		client = redis.NewClient(options)
+	})
+
+	AfterEach(func() {
+		err := client.Close()
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("does not contend on connection dial for concurrent commands", func() {
+		var wg sync.WaitGroup
+
+		const concurrency = 10
+
+		durations := make(chan time.Duration, concurrency)
+		errs := make(chan error, concurrency)
+
+		start := time.Now()
+		wg.Add(concurrency)
+
+		for i := 0; i < concurrency; i++ {
+			go func() {
+				defer wg.Done()
+
+				start := time.Now()
+				err := client.Ping(ctx).Err()
+				durations <- time.Since(start)
+				errs <- err
+			}()
+		}
+
+		wg.Wait()
+		close(durations)
+		close(errs)
+
+		// All commands should eventually succeed, after acquiring a connection.
+		for err := range errs {
+			Expect(err).NotTo(HaveOccurred())
+		}
+
+		// Each individual command should complete within the simulated dial duration bound.
+		for duration := range durations {
+			Expect(duration).To(BeNumerically("<", 2*dialSimulatedDelay))
+		}
+
+		// Due to concurrent execution, the entire test suite should also complete within
+		// the same dial duration bound applied for individual commands.
+		Expect(time.Since(start)).To(BeNumerically("<", 2*dialSimulatedDelay))
+	})
+})
+
+// NonRedisEnterprise: these specs exercise client-side credential-provider
+// precedence against a local Redis (recording the AUTH command sent) and require
+// a localhost server; they are not meaningful against a remote Enterprise cluster.
+var _ = Describe("Credentials Provider Priority", Label("NonRedisEnterprise"), func() {
+	var client *redis.Client
+	var opt *redis.Options
+	var recorder *commandRecorder
+
+	BeforeEach(func() {
+		recorder = newCommandRecorder(10)
+	})
+
+	AfterEach(func() {
+		if client != nil {
+			Expect(client.Close()).NotTo(HaveOccurred())
+		}
+	})
+
+	It("should use streaming provider when available", func() {
+		streamingCreds := auth.NewBasicCredentials("streaming_user", "streaming_pass")
+		ctxCreds := auth.NewBasicCredentials("ctx_user", "ctx_pass")
+		providerCreds := auth.NewBasicCredentials("provider_user", "provider_pass")
+
+		opt = &redis.Options{
+			Username: "field_user",
+			Password: "field_pass",
+			CredentialsProvider: func() (string, string) {
+				username, password := providerCreds.BasicAuth()
+				return username, password
+			},
+			CredentialsProviderContext: func(ctx context.Context) (string, string, error) {
+				username, password := ctxCreds.BasicAuth()
+				return username, password, nil
+			},
+			StreamingCredentialsProvider: &mockStreamingProvider{
+				credentials: streamingCreds,
+				updates:     make(chan auth.Credentials, 1),
+			},
+		}
+
+		client = redis.NewClient(opt)
+		client.AddHook(recorder.Hook())
+		// wrongpass
+		Expect(client.Ping(context.Background()).Err()).To(HaveOccurred())
+		Expect(recorder.Contains("AUTH streaming_user")).To(BeTrue())
+	})
+
+	It("should use context provider when streaming provider is not available", func() {
+		ctxCreds := auth.NewBasicCredentials("ctx_user", "ctx_pass")
+		providerCreds := auth.NewBasicCredentials("provider_user", "provider_pass")
+
+		opt = &redis.Options{
+			Username: "field_user",
+			Password: "field_pass",
+			CredentialsProvider: func() (string, string) {
+				username, password := providerCreds.BasicAuth()
+				return username, password
+			},
+			CredentialsProviderContext: func(ctx context.Context) (string, string, error) {
+				username, password := ctxCreds.BasicAuth()
+				return username, password, nil
+			},
+		}
+
+		client = redis.NewClient(opt)
+		client.AddHook(recorder.Hook())
+		// wrongpass
+		Expect(client.Ping(context.Background()).Err()).To(HaveOccurred())
+		Expect(recorder.Contains("AUTH ctx_user")).To(BeTrue())
+	})
+
+	It("should use regular provider when streaming and context providers are not available", func() {
+		providerCreds := auth.NewBasicCredentials("provider_user", "provider_pass")
+
+		opt = &redis.Options{
+			Username: "field_user",
+			Password: "field_pass",
+			CredentialsProvider: func() (string, string) {
+				username, password := providerCreds.BasicAuth()
+				return username, password
+			},
+		}
+
+		client = redis.NewClient(opt)
+		client.AddHook(recorder.Hook())
+		// wrongpass
+		Expect(client.Ping(context.Background()).Err()).To(HaveOccurred())
+		Expect(recorder.Contains("AUTH provider_user")).To(BeTrue())
+	})
+
+	It("should use username/password fields when no providers are set", func() {
+		opt = &redis.Options{
+			Username: "field_user",
+			Password: "field_pass",
+		}
+
+		client = redis.NewClient(opt)
+		client.AddHook(recorder.Hook())
+		// wrongpass
+		Expect(client.Ping(context.Background()).Err()).To(HaveOccurred())
+		Expect(recorder.Contains("AUTH field_user")).To(BeTrue())
+	})
+
+	It("should use empty credentials when nothing is set", func() {
+		opt = &redis.Options{}
+
+		client = redis.NewClient(opt)
+		client.AddHook(recorder.Hook())
+		// no pass, ok
+		Expect(client.Ping(context.Background()).Err()).NotTo(HaveOccurred())
+		Expect(recorder.Contains("AUTH")).To(BeFalse())
+	})
+
+	It("should handle credential updates from streaming provider", func() {
+		initialCreds := auth.NewBasicCredentials("initial_user", "initial_pass")
+		updatedCreds := auth.NewBasicCredentials("updated_user", "updated_pass")
+		updatesChan := make(chan auth.Credentials, 1)
+
+		opt = &redis.Options{
+			StreamingCredentialsProvider: &mockStreamingProvider{
+				credentials: initialCreds,
+				updates:     updatesChan,
+			},
+			PoolSize: 1, // Force single connection to ensure reauth is tested
+		}
+
+		client = redis.NewClient(opt)
+		client.AddHook(recorder.Hook())
+		// wrongpass
+		Expect(client.Ping(context.Background()).Err()).To(HaveOccurred())
+		time.Sleep(10 * time.Millisecond)
+		Expect(recorder.Contains("AUTH initial_user")).To(BeTrue())
+
+		// Update credentials
+		opt.StreamingCredentialsProvider.(*mockStreamingProvider).updates <- updatedCreds
+
+		// Wait for reauth to complete and verify updated credentials are used
+		// We need to keep trying Ping until we see the updated AUTH command
+		// because the reauth happens asynchronously
+		Eventually(func() bool {
+			// wrongpass
+			_ = client.Ping(context.Background()).Err()
+			return recorder.Contains("AUTH updated_user")
+		}, "1s", "50ms").Should(BeTrue())
+
+		close(updatesChan)
+	})
+})
+
+type mockStreamingProvider struct {
+	mu          sync.RWMutex
+	credentials auth.Credentials
+	err         error
+	updates     chan auth.Credentials
+}
+
+func (m *mockStreamingProvider) Subscribe(listener auth.CredentialsListener) (auth.Credentials, auth.UnsubscribeFunc, error) {
+	if m.err != nil {
+		return nil, nil, m.err
+	}
+
+	if listener == nil {
+		return nil, nil, errors.New("listener cannot be nil")
+	}
+
+	// Create a done channel to stop the goroutine
+	done := make(chan struct{})
+
+	// Start goroutine to handle updates
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// this is just a mock:
+				// allow panics to be caught without crashing
+			}
+		}()
+
+		for {
+			select {
+			case <-done:
+				return
+			case creds, ok := <-m.updates:
+				if !ok {
+					return
+				}
+				m.mu.Lock()
+				m.credentials = creds
+				m.mu.Unlock()
+				listener.OnNext(creds)
+			}
+		}
+	}()
+
+	m.mu.RLock()
+	currentCreds := m.credentials
+	m.mu.RUnlock()
+
+	return currentCreds, func() (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				// this is just a mock:
+				// allow multiple closes from multiple listeners
+			}
+		}()
+		close(done)
+		return
+	}, nil
+}
+
+var _ = Describe("Client creation", func() {
+	Context("simple client with nil options", func() {
+		It("panics", func() {
+			Expect(func() {
+				redis.NewClient(nil)
+			}).To(Panic())
+		})
+	})
+	Context("cluster client with nil options", func() {
+		It("panics", func() {
+			Expect(func() {
+				redis.NewClusterClient(nil)
+			}).To(Panic())
+		})
+	})
+	Context("ring client with nil options", func() {
+		It("panics", func() {
+			Expect(func() {
+				redis.NewRing(nil)
+			}).To(Panic())
+		})
+	})
+	Context("universal client with nil options", func() {
+		It("panics", func() {
+			Expect(func() {
+				redis.NewUniversalClient(nil)
+			}).To(Panic())
+		})
+	})
+	Context("failover client with nil options", func() {
+		It("panics", func() {
+			Expect(func() {
+				redis.NewFailoverClient(nil)
+			}).To(Panic())
+		})
+	})
+	Context("failover cluster client with nil options", func() {
+		It("panics", func() {
+			Expect(func() {
+				redis.NewFailoverClusterClient(nil)
+			}).To(Panic())
+		})
+	})
+	Context("sentinel client with nil options", func() {
+		It("panics", func() {
+			Expect(func() {
+				redis.NewSentinelClient(nil)
+			}).To(Panic())
+		})
 	})
 })

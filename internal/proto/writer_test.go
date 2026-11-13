@@ -3,14 +3,25 @@ package proto_test
 import (
 	"bytes"
 	"encoding"
+	"fmt"
+	"net"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/go-redis/redis/v8/internal/proto"
+	. "github.com/bsm/ginkgo/v2"
+	. "github.com/bsm/gomega"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/redis/go-redis/v9/internal/proto"
+	"github.com/redis/go-redis/v9/internal/util"
 )
+
+// countingWriter counts the calls that write to it.
+type countingWriter struct{ writes int }
+
+func (w *countingWriter) Write(b []byte) (int, error)       { w.writes++; return len(b), nil }
+func (w *countingWriter) WriteByte(byte) error              { w.writes++; return nil }
+func (w *countingWriter) WriteString(s string) (int, error) { w.writes++; return len(s), nil }
 
 type MyType struct{}
 
@@ -50,8 +61,29 @@ var _ = Describe("WriteBuffer", func() {
 			"\r\n")))
 	})
 
+	It("should write bulk strings around the one-write limit", func() {
+		for _, n := range []int{127, 128, 129, 1024} {
+			buf.Reset()
+			val := strings.Repeat("v", n)
+			err := wr.WriteArgs([]interface{}{val, []byte(val)})
+			Expect(err).NotTo(HaveOccurred())
+
+			bulk := fmt.Sprintf("$%d\r\n%s\r\n", n, val)
+			Expect(buf.String()).To(Equal("*2\r\n" + bulk + bulk))
+		}
+	})
+
+	It("should use one Write up to the limit and four above it", func() {
+		for n, writes := range map[int]int{128: 1, 129: 4} {
+			cw := &countingWriter{}
+			err := proto.NewWriter(cw).WriteArg(strings.Repeat("v", n))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cw.writes).To(Equal(writes), "value of %d bytes", n)
+		}
+	})
+
 	It("should append time", func() {
-		tm := time.Date(2019, 01, 01, 9, 45, 10, 222125, time.UTC)
+		tm := time.Date(2019, 1, 1, 9, 45, 10, 222125, time.UTC)
 		err := wr.WriteArgs([]interface{}{tm})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -63,6 +95,13 @@ var _ = Describe("WriteBuffer", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		Expect(buf.Len()).To(Equal(15))
+	})
+
+	It("should append net.IP", func() {
+		ip := net.ParseIP("192.168.1.1")
+		err := wr.WriteArgs([]interface{}{ip})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(buf.String()).To(Equal(fmt.Sprintf("*1\r\n$16\r\n%s\r\n", bytes.NewBuffer(ip))))
 	})
 })
 
@@ -91,3 +130,82 @@ func BenchmarkWriteBuffer_Append(b *testing.B) {
 		}
 	}
 }
+
+var _ = Describe("WriteArg", func() {
+	var buf *bytes.Buffer
+	var wr *proto.Writer
+
+	BeforeEach(func() {
+		buf = new(bytes.Buffer)
+		wr = proto.NewWriter(buf)
+	})
+
+	t := time.Date(2025, 2, 8, 00, 00, 00, 0, time.UTC)
+
+	args := map[any]string{
+		"hello":                                "$5\r\nhello\r\n",
+		util.ToPtr("hello"):                    "$5\r\nhello\r\n",
+		(*string)(nil):                         "$0\r\n\r\n",
+		int(10):                                "$2\r\n10\r\n",
+		util.ToPtr(int(10)):                    "$2\r\n10\r\n",
+		(*int)(nil):                            "$1\r\n0\r\n",
+		int8(10):                               "$2\r\n10\r\n",
+		util.ToPtr(int8(10)):                   "$2\r\n10\r\n",
+		(*int8)(nil):                           "$1\r\n0\r\n",
+		int16(10):                              "$2\r\n10\r\n",
+		util.ToPtr(int16(10)):                  "$2\r\n10\r\n",
+		(*int16)(nil):                          "$1\r\n0\r\n",
+		int32(10):                              "$2\r\n10\r\n",
+		util.ToPtr(int32(10)):                  "$2\r\n10\r\n",
+		(*int32)(nil):                          "$1\r\n0\r\n",
+		int64(10):                              "$2\r\n10\r\n",
+		util.ToPtr(int64(10)):                  "$2\r\n10\r\n",
+		(*int64)(nil):                          "$1\r\n0\r\n",
+		uint(10):                               "$2\r\n10\r\n",
+		util.ToPtr(uint(10)):                   "$2\r\n10\r\n",
+		(*uint)(nil):                           "$1\r\n0\r\n",
+		uint8(10):                              "$2\r\n10\r\n",
+		util.ToPtr(uint8(10)):                  "$2\r\n10\r\n",
+		(*uint8)(nil):                          "$1\r\n0\r\n",
+		uint16(10):                             "$2\r\n10\r\n",
+		util.ToPtr(uint16(10)):                 "$2\r\n10\r\n",
+		(*uint16)(nil):                         "$1\r\n0\r\n",
+		uint32(10):                             "$2\r\n10\r\n",
+		util.ToPtr(uint32(10)):                 "$2\r\n10\r\n",
+		(*uint32)(nil):                         "$1\r\n0\r\n",
+		uint64(10):                             "$2\r\n10\r\n",
+		util.ToPtr(uint64(10)):                 "$2\r\n10\r\n",
+		(*uint64)(nil):                         "$1\r\n0\r\n",
+		uintptr(10):                            "$2\r\n10\r\n",
+		util.ToPtr(uintptr(10)):                "$2\r\n10\r\n",
+		(*uintptr)(nil):                        "$1\r\n0\r\n",
+		float32(10.3):                          "$18\r\n10.300000190734863\r\n",
+		util.ToPtr(float32(10.3)):              "$18\r\n10.300000190734863\r\n",
+		(*float32)(nil):                        "$1\r\n0\r\n",
+		float64(10.3):                          "$4\r\n10.3\r\n",
+		util.ToPtr(float64(10.3)):              "$4\r\n10.3\r\n",
+		(*float64)(nil):                        "$1\r\n0\r\n",
+		bool(true):                             "$1\r\n1\r\n",
+		bool(false):                            "$1\r\n0\r\n",
+		util.ToPtr(bool(true)):                 "$1\r\n1\r\n",
+		util.ToPtr(bool(false)):                "$1\r\n0\r\n",
+		(*bool)(nil):                           "$1\r\n0\r\n",
+		time.Time(t):                           "$20\r\n2025-02-08T00:00:00Z\r\n",
+		util.ToPtr(time.Time(t)):               "$20\r\n2025-02-08T00:00:00Z\r\n",
+		(*time.Time)(nil):                      "$20\r\n0001-01-01T00:00:00Z\r\n",
+		time.Duration(time.Second):             "$10\r\n1000000000\r\n",
+		util.ToPtr(time.Duration(time.Second)): "$10\r\n1000000000\r\n",
+		(*time.Duration)(nil):                  "$1\r\n0\r\n",
+		(encoding.BinaryMarshaler)(&MyType{}):  "$5\r\nhello\r\n",
+		(encoding.BinaryMarshaler)(nil):        "$0\r\n\r\n",
+	}
+
+	for arg, expect := range args {
+		arg, expect := arg, expect
+		It(fmt.Sprintf("should write arg of type %T", arg), func() {
+			err := wr.WriteArg(arg)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(buf.String()).To(Equal(expect))
+		})
+	}
+})

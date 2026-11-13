@@ -1,13 +1,22 @@
-module github.com/go-redis/redis/v8
+module github.com/redis/go-redis/v9
 
-go 1.13
+go 1.26.0
 
 require (
-	github.com/cespare/xxhash/v2 v2.1.1
-	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f
-	github.com/onsi/ginkgo v1.15.0
-	github.com/onsi/gomega v1.10.5
-	go.opentelemetry.io/otel v0.20.0
-	go.opentelemetry.io/otel/metric v0.20.0
-	go.opentelemetry.io/otel/trace v0.20.0
+	github.com/bsm/ginkgo/v2 v2.12.0
+	github.com/bsm/gomega v1.27.10
+	github.com/cespare/xxhash/v2 v2.3.0
+	github.com/zeebo/xxh3 v1.1.0
+	go.uber.org/atomic v1.12.0
+	golang.org/x/sys v0.49.0
+)
+
+require github.com/klauspost/cpuid/v2 v2.4.0 // indirect
+
+retract (
+	v9.15.1 // This version is used to retract v9.15.0
+	v9.15.0 // This version was accidentally released. It is identical to 9.15.0-beta.2
+	v9.7.2 // This version was accidentally released. Please use version 9.7.3 instead.
+	v9.5.4 // This version was accidentally released. Please use version 9.6.0 instead.
+	v9.5.3 // This version was accidentally released. Please use version 9.6.0 instead.
 )

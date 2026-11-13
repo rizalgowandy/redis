@@ -1,30 +1,24 @@
 package redis_test
 
 import (
-	"context"
 	"io"
 	"net"
 	"sync"
 	"time"
 
-	"github.com/go-redis/redis/v8"
+	. "github.com/bsm/ginkgo/v2"
+	. "github.com/bsm/gomega"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/redis/go-redis/v9"
 )
 
 var _ = Describe("PubSub", func() {
 	var client *redis.Client
-	var clientID int64
 
 	BeforeEach(func() {
 		opt := redisOptions()
 		opt.MinIdleConns = 0
-		opt.MaxConnAge = 0
-		opt.OnConnect = func(ctx context.Context, cn *redis.Conn) (err error) {
-			clientID, err = cn.ClientID(ctx).Result()
-			return err
-		}
+		opt.ConnMaxLifetime = 0
 		client = redis.NewClient(opt)
 		Expect(client.FlushDB(ctx).Err()).NotTo(HaveOccurred())
 	})
@@ -87,6 +81,72 @@ var _ = Describe("PubSub", func() {
 		Expect(stats.Misses).To(Equal(uint32(1)))
 	})
 
+	It("should receive hash field subkey notifications", Label("hash-expiration", "NonRedisEnterprise"), func() {
+		SkipBeforeRedisVersion("8.8", "subkeyspace notifications require Redis 8.8")
+
+		config, err := client.ConfigGet(ctx, "notify-keyspace-events").Result()
+		Expect(err).NotTo(HaveOccurred())
+		previousNotifyConfig := config["notify-keyspace-events"]
+		Expect(client.ConfigSet(ctx, "notify-keyspace-events", "STh").Err()).NotTo(HaveOccurred())
+		defer client.ConfigSet(ctx, "notify-keyspace-events", previousNotifyConfig)
+
+		const (
+			hashKey         = "skn:hash"
+			field           = "field-alpha"
+			hexpireChannel  = "__subkeyevent@0__:hexpire"
+			expiredChannel  = "__subkeyevent@0__:hexpired"
+			expectedPayload = "8:skn:hash|11:field-alpha"
+		)
+		Expect(client.Del(ctx, hashKey).Err()).NotTo(HaveOccurred())
+
+		pubsub := client.Subscribe(ctx, hexpireChannel, expiredChannel)
+		defer pubsub.Close()
+
+		for _, expected := range []redis.Subscription{
+			{Kind: "subscribe", Channel: hexpireChannel, Count: 1},
+			{Kind: "subscribe", Channel: expiredChannel, Count: 2},
+		} {
+			msgi, err := pubsub.ReceiveTimeout(ctx, time.Second)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(msgi).To(Equal(&expected))
+		}
+
+		Expect(client.HSet(ctx, hashKey, field, "value").Err()).NotTo(HaveOccurred())
+		res, err := client.HPExpire(ctx, hashKey, 50*time.Millisecond, field).Result()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res).To(Equal([]int64{1}))
+
+		seen := make(map[string]string)
+		deadline := time.Now().Add(10 * time.Second)
+
+		for time.Now().Before(deadline) &&
+			(seen[hexpireChannel] == "" || seen[expiredChannel] == "") {
+			msgi, err := pubsub.ReceiveTimeout(ctx, 500*time.Millisecond)
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue
+				}
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			msg, ok := msgi.(*redis.Message)
+			if !ok {
+				continue
+			}
+			if msg.Channel != hexpireChannel && msg.Channel != expiredChannel {
+				continue
+			}
+
+			Expect(msg.Pattern).To(BeEmpty())
+			Expect(msg.Payload).To(Equal(expectedPayload))
+			Expect(msg.PayloadSlice).To(BeEmpty())
+			seen[msg.Channel] = msg.Payload
+		}
+
+		Expect(seen).To(HaveKeyWithValue(hexpireChannel, expectedPayload))
+		Expect(seen).To(HaveKeyWithValue(expiredChannel, expectedPayload))
+	})
+
 	It("should pub/sub channels", func() {
 		channels, err := client.PubSubChannels(ctx, "mychannel*").Result()
 		Expect(err).NotTo(HaveOccurred())
@@ -94,6 +154,9 @@ var _ = Describe("PubSub", func() {
 
 		pubsub := client.Subscribe(ctx, "mychannel", "mychannel2")
 		defer pubsub.Close()
+
+		// sleep a bit to make sure redis knows about the subscriptions
+		time.Sleep(10 * time.Millisecond)
 
 		channels, err = client.PubSubChannels(ctx, "mychannel*").Result()
 		Expect(err).NotTo(HaveOccurred())
@@ -108,10 +171,44 @@ var _ = Describe("PubSub", func() {
 		Expect(len(channels)).To(BeNumerically(">=", 2))
 	})
 
+	It("should sharded pub/sub channels", func() {
+		channels, err := client.PubSubShardChannels(ctx, "mychannel*").Result()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(channels).To(BeEmpty())
+
+		pubsub := client.SSubscribe(ctx, "mychannel", "mychannel2")
+		defer pubsub.Close()
+
+		// Let Redis process the ssubscribe command.
+		time.Sleep(10 * time.Millisecond)
+
+		channels, err = client.PubSubShardChannels(ctx, "mychannel*").Result()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(channels).To(ConsistOf([]string{"mychannel", "mychannel2"}))
+
+		channels, err = client.PubSubShardChannels(ctx, "").Result()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(channels).To(BeEmpty())
+
+		channels, err = client.PubSubShardChannels(ctx, "*").Result()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(len(channels)).To(BeNumerically(">=", 2))
+
+		nums, err := client.PubSubShardNumSub(ctx, "mychannel", "mychannel2", "mychannel3").Result()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(nums).To(Equal(map[string]int64{
+			"mychannel":  1,
+			"mychannel2": 1,
+			"mychannel3": 0,
+		}))
+	})
+
 	It("should return the numbers of subscribers", func() {
 		pubsub := client.Subscribe(ctx, "mychannel", "mychannel2")
 		defer pubsub.Close()
 
+		// sleep a bit to make sure redis knows about the subscriptions
+		time.Sleep(10 * time.Millisecond)
 		channels, err := client.PubSubNumSub(ctx, "mychannel", "mychannel2", "mychannel3").Result()
 		Expect(err).NotTo(HaveOccurred())
 		Expect(channels).To(Equal(map[string]int64{
@@ -129,6 +226,8 @@ var _ = Describe("PubSub", func() {
 		pubsub := client.PSubscribe(ctx, "*")
 		defer pubsub.Close()
 
+		// sleep a bit to make sure redis knows about the subscriptions
+		time.Sleep(10 * time.Millisecond)
 		num, err = client.PubSubNumPat(ctx).Result()
 		Expect(err).NotTo(HaveOccurred())
 		Expect(num).To(Equal(int64(1)))
@@ -202,6 +301,82 @@ var _ = Describe("PubSub", func() {
 			Expect(err).NotTo(HaveOccurred())
 			subscr := msgi.(*redis.Subscription)
 			Expect(subscr.Kind).To(Equal("unsubscribe"))
+			Expect(subscr.Channel).To(Equal("mychannel2"))
+			Expect(subscr.Count).To(Equal(0))
+		}
+
+		stats := client.PoolStats()
+		Expect(stats.Misses).To(Equal(uint32(1)))
+	})
+
+	It("should sharded pub/sub", func() {
+		pubsub := client.SSubscribe(ctx, "mychannel", "mychannel2")
+		defer pubsub.Close()
+
+		{
+			msgi, err := pubsub.ReceiveTimeout(ctx, time.Second)
+			Expect(err).NotTo(HaveOccurred())
+			subscr := msgi.(*redis.Subscription)
+			Expect(subscr.Kind).To(Equal("ssubscribe"))
+			Expect(subscr.Channel).To(Equal("mychannel"))
+			Expect(subscr.Count).To(Equal(1))
+		}
+
+		{
+			msgi, err := pubsub.ReceiveTimeout(ctx, time.Second)
+			Expect(err).NotTo(HaveOccurred())
+			subscr := msgi.(*redis.Subscription)
+			Expect(subscr.Kind).To(Equal("ssubscribe"))
+			Expect(subscr.Channel).To(Equal("mychannel2"))
+			Expect(subscr.Count).To(Equal(2))
+		}
+
+		{
+			msgi, err := pubsub.ReceiveTimeout(ctx, time.Second)
+			Expect(err.(net.Error).Timeout()).To(Equal(true))
+			Expect(msgi).NotTo(HaveOccurred())
+		}
+
+		n, err := client.SPublish(ctx, "mychannel", "hello").Result()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(n).To(Equal(int64(1)))
+
+		n, err = client.SPublish(ctx, "mychannel2", "hello2").Result()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(n).To(Equal(int64(1)))
+
+		Expect(pubsub.SUnsubscribe(ctx, "mychannel", "mychannel2")).NotTo(HaveOccurred())
+
+		{
+			msgi, err := pubsub.ReceiveTimeout(ctx, time.Second)
+			Expect(err).NotTo(HaveOccurred())
+			msg := msgi.(*redis.Message)
+			Expect(msg.Channel).To(Equal("mychannel"))
+			Expect(msg.Payload).To(Equal("hello"))
+		}
+
+		{
+			msgi, err := pubsub.ReceiveTimeout(ctx, time.Second)
+			Expect(err).NotTo(HaveOccurred())
+			msg := msgi.(*redis.Message)
+			Expect(msg.Channel).To(Equal("mychannel2"))
+			Expect(msg.Payload).To(Equal("hello2"))
+		}
+
+		{
+			msgi, err := pubsub.ReceiveTimeout(ctx, time.Second)
+			Expect(err).NotTo(HaveOccurred())
+			subscr := msgi.(*redis.Subscription)
+			Expect(subscr.Kind).To(Equal("sunsubscribe"))
+			Expect(subscr.Channel).To(Equal("mychannel"))
+			Expect(subscr.Count).To(Equal(1))
+		}
+
+		{
+			msgi, err := pubsub.ReceiveTimeout(ctx, time.Second)
+			Expect(err).NotTo(HaveOccurred())
+			subscr := msgi.(*redis.Subscription)
+			Expect(subscr.Kind).To(Equal("sunsubscribe"))
 			Expect(subscr.Channel).To(Equal("mychannel2"))
 			Expect(subscr.Count).To(Equal(0))
 		}
@@ -421,30 +596,6 @@ var _ = Describe("PubSub", func() {
 		Expect(msg.Payload).To(Equal(string(bigVal)))
 	})
 
-	It("handles message payload slice with server-assisted client-size caching", func() {
-		pubsub := client.Subscribe(ctx, "__redis__:invalidate")
-		defer pubsub.Close()
-
-		client2 := redis.NewClient(redisOptions())
-		defer client2.Close()
-
-		err := client2.Do(ctx, "CLIENT", "TRACKING", "on", "REDIRECT", clientID).Err()
-		Expect(err).NotTo(HaveOccurred())
-
-		err = client2.Do(ctx, "GET", "mykey").Err()
-		Expect(err).To(Equal(redis.Nil))
-
-		err = client2.Do(ctx, "SET", "mykey", "myvalue").Err()
-		Expect(err).NotTo(HaveOccurred())
-
-		ch := pubsub.Channel()
-
-		var msg *redis.Message
-		Eventually(ch).Should(Receive(&msg))
-		Expect(msg.Channel).To(Equal("__redis__:invalidate"))
-		Expect(msg.PayloadSlice).To(Equal([]string{"mykey"}))
-	})
-
 	It("supports concurrent Ping and Receive", func() {
 		const N = 100
 
@@ -472,5 +623,101 @@ var _ = Describe("PubSub", func() {
 		case <-time.After(30 * time.Second):
 			Fail("timeout")
 		}
+	})
+
+	It("should ClientSetName on PubSub connection", func() {
+		pubsub := client.Subscribe(ctx, "test-channel")
+		defer pubsub.Close()
+
+		// Wait for subscription to be established
+		_, err := pubsub.Receive(ctx)
+		Expect(err).NotTo(HaveOccurred())
+
+		err = pubsub.ClientSetName(ctx, "my-subscriber")
+		Expect(err).NotTo(HaveOccurred())
+
+		// PubSub.ClientSetName only writes the command; the +OK reply is
+		// drained here. This also synchronizes us with the server so that
+		// the subsequent CLIENT LIST on a different connection observes
+		// the rename (CLIENT LIST may otherwise race the SETNAME packet).
+		_, err = pubsub.Receive(ctx)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Verify the name is set via CLIENT LIST
+		clientList, err := client.ClientList(ctx).Result()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(clientList).To(ContainSubstring("name=my-subscriber"))
+	})
+
+	It("should ChannelMessage", func() {
+		pubsub := client.Subscribe(ctx, "mychannel")
+		defer pubsub.Close()
+
+		// Wait for the SUBSCRIBE confirmation before calling Channel(), so the
+		// server is guaranteed to have registered the subscription before we
+		// Publish. Once Channel() starts its pump goroutine, all subsequent
+		// reads happen there and Subscription frames are filtered out.
+		_, err := pubsub.ReceiveTimeout(ctx, 5*time.Second)
+		Expect(err).NotTo(HaveOccurred())
+
+		ch := pubsub.Channel(
+			redis.WithChannelSize(10),
+			redis.WithChannelHealthCheckInterval(time.Second),
+		)
+
+		text := "test channel message"
+		err = client.Publish(ctx, "mychannel", text).Err()
+		Expect(err).NotTo(HaveOccurred())
+
+		var msg *redis.Message
+		Eventually(ch, 5*time.Second).Should(Receive(&msg))
+		Expect(msg.Channel).To(Equal("mychannel"))
+		Expect(msg.Payload).To(Equal(text))
+	})
+
+	It("closes Channel when PubSub with sticky error is consumed", func() {
+		ring := redis.NewRing(&redis.RingOptions{})
+		defer ring.Close()
+
+		// Ring.Subscribe with no channels returns a failedPubSub with stickyErr
+		pubsub := ring.Subscribe(ctx)
+
+		ch := pubsub.Channel()
+		Eventually(ch, 5*time.Second).Should(BeClosed())
+
+		// Verify range does not hang
+		for range ch {
+			Fail("should not receive messages from failed pubsub channel")
+		}
+
+		Expect(pubsub.Close()).To(Succeed())
+	})
+
+	It("closes ChannelWithSubscriptions when PubSub with sticky error is consumed", func() {
+		ring := redis.NewRing(&redis.RingOptions{})
+		defer ring.Close()
+
+		pubsub := ring.Subscribe(ctx)
+
+		ch := pubsub.ChannelWithSubscriptions()
+		Eventually(ch, 5*time.Second).Should(BeClosed())
+
+		for range ch {
+			Fail("should not receive messages from failed pubsub channel")
+		}
+
+		Expect(pubsub.Close()).To(Succeed())
+	})
+
+	It("returns closed channel when calling conflicting Channel methods", func() {
+		pubsub := client.Subscribe(ctx, "mychannel")
+		defer pubsub.Close()
+
+		ch1 := pubsub.Channel()
+		Expect(ch1).NotTo(BeNil())
+
+		// Second call with ChannelWithSubscriptions should return closed channel
+		ch2 := pubsub.ChannelWithSubscriptions()
+		Eventually(ch2, 5*time.Second).Should(BeClosed())
 	})
 })

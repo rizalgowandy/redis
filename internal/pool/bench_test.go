@@ -2,11 +2,12 @@ package pool_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 
-	"github.com/go-redis/redis/v8/internal/pool"
+	"github.com/redis/go-redis/v9/internal/pool"
 )
 
 type poolGetPutBenchmark struct {
@@ -31,10 +32,11 @@ func BenchmarkPoolGetPut(b *testing.B) {
 		b.Run(bm.String(), func(b *testing.B) {
 			connPool := pool.NewConnPool(&pool.Options{
 				Dialer:             dummyDialer,
-				PoolSize:           bm.poolSize,
+				PoolSize:           int32(bm.poolSize),
+				MaxConcurrentDials: bm.poolSize,
 				PoolTimeout:        time.Second,
-				IdleTimeout:        time.Hour,
-				IdleCheckFrequency: time.Hour,
+				DialTimeout:        1 * time.Second,
+				ConnMaxIdleTime:    time.Hour,
 			})
 
 			b.ResetTimer()
@@ -75,21 +77,22 @@ func BenchmarkPoolGetRemove(b *testing.B) {
 		b.Run(bm.String(), func(b *testing.B) {
 			connPool := pool.NewConnPool(&pool.Options{
 				Dialer:             dummyDialer,
-				PoolSize:           bm.poolSize,
+				PoolSize:           int32(bm.poolSize),
+				MaxConcurrentDials: bm.poolSize,
 				PoolTimeout:        time.Second,
-				IdleTimeout:        time.Hour,
-				IdleCheckFrequency: time.Hour,
+				DialTimeout:        1 * time.Second,
+				ConnMaxIdleTime:    time.Hour,
 			})
 
 			b.ResetTimer()
-
+			rmvErr := errors.New("Bench test remove")
 			b.RunParallel(func(pb *testing.PB) {
 				for pb.Next() {
 					cn, err := connPool.Get(ctx)
 					if err != nil {
 						b.Fatal(err)
 					}
-					connPool.Remove(ctx, cn, nil)
+					connPool.Remove(ctx, cn, rmvErr)
 				}
 			})
 		})
